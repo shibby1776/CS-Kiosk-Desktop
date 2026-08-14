@@ -1,3 +1,4 @@
+
 # ShibbyPrints Kiosk Sorter Software
 
 **Kiosk 2.2 Public**
@@ -82,9 +83,13 @@ application.
 
 ## Operator and Maintenance interfaces
 
+<img width="2667" height="1356" alt="op-run1" src="https://github.com/user-attachments/assets/c81ca1eb-8f76-425b-8631-3f0e72037c9a" />
+
+
 Operator Mode contains only the controls needed during normal sorting.
 Maintenance Mode contains model, camera, serial, routing, training, and service
 controls intended for setup and troubleshooting.
+<img width="2666" height="1371" alt="maint-run2" src="https://github.com/user-attachments/assets/a892f00f-9aef-4835-bf42-9709f7723518" />
 
 **Clear Slots** removes current slot assignments and resets counters after
 confirmation. Classification names remain available so the operator can remap
@@ -94,6 +99,7 @@ configuration.
 ## Saved slot configurations
 
 Maintenance → Run → **Load Slot Config** opens the Saved Bins manager.
+<img width="891" height="590" alt="save-bins" src="https://github.com/user-attachments/assets/f76f899d-7564-44fe-91d6-c80b2f21d151" />
 
 Portable configurations:
 
@@ -114,6 +120,9 @@ operations occur only when a user presses an import or export button; no drive
 watcher or polling task runs in the background.
 
 ## Hidden diagnostics
+
+
+<img width="1190" height="693" alt="sensor tests" src="https://github.com/user-attachments/assets/8240e13e-8101-428f-bd10-24b67b328cbf" />
 
 Diagnostics are disabled at startup. Press **Ctrl+D** to create and enable the
 diagnostic environment. Press **Ctrl+D** again to stop collection, destroy the
