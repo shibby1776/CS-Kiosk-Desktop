@@ -5,10 +5,10 @@
 
 ## Overview
 
-ShibbyPrints Kiosk Sorter Software is a production-focused desktop application
+ShibbyPrints Kiosk Sorter Software is a production-focused application
 for operating a compatible CS7.2 case sorter. It provides a simplified
 Operator interface, technician-focused Maintenance controls, local and remote
-classification, portable slot configurations, and on-demand diagnostics.
+classification, portable slot configurations, and on-demand diagnostics. This is the desktop version of the software with the Raspberry Pi version to release in a different repository.
 
 ## Safety and Intended Use
 
@@ -54,6 +54,25 @@ Upstream reference commit:
 See `NOTICE` for copyright, attribution, and modification information. This
 source archive is the corresponding source for the matching public Setup
 executable.
+How the pieces fit together
+
+## How the pieces fit together
+
+The case sorter is built from a few separate repositories. **This repo is just
+the desktop software.**
+
+| Project | What it is | Link |
+|---------|-----------|------|
+| **Kiosk (this repo)** | The cross-platform desktop app: capture, classify, route, train, evaluate. | — |
+| **CS7.2 hardware** | 3D-printable models, build kits, assembly guides, and the Arduino-based firmware the app talks to over serial. | [AI-Case-Sorter-CS7.2](https://github.com/sjseth/AI-Case-Sorter-CS7.2) |
+| **CaseSorter AI Server** | A small local HTTP server that hosts your trained ConvNeXt models behind an OpenAI-compatible API. This is what **AI Config mode** points at. | [AI-Case-Sorter-Server](https://github.com/sjseth/AI-Case-Sorter-Server) |
+| **Community backend** | Hosted service at [reloadingrecipes.com](https://www.reloadingrecipes.com/HeadstampSorter) for sign-in, model sharing/downloads, and the feedback loop. A separate hosted service — **not** part of this open-source release. | [reloadingrecipes.com](https://www.reloadingrecipes.com/HeadstampSorter) |
+
+You do **not** need an account to use the app. Everything except community
+sharing/downloads works locally and offline.
+
+---
+
 
 ## Installation
 
@@ -161,5 +180,5 @@ https://shop.sjseth.com/
 Printed-parts kits and assembled CS7.2 sorter units:
 https://www.shibbyprints.com/
 
-Software information and community Discord link:
+Mainline Software information and community Discord link:
 https://www.reloadingrecipes.com/HeadstampSorter
