@@ -1,0 +1,57 @@
+ShibbyPrints Kiosk Sorter Software
+Kiosk 2.2 Public
+
+SAFETY AND INTENDED USE
+
+This software controls a motorized case sorter intended only for sorting inert,
+already-fired brass cartridge cases by their headstamps. It is not intended for
+live ammunition and contains no ammunition-loading or load-data functions.
+
+Connected sorter hardware contains moving mechanisms, pinch points, motors,
+and electrical components. Keep hands, loose clothing, tools, and other objects
+clear while the machine is powered or moving. Stop the application and
+disconnect power before clearing jams, adjusting components, or servicing the
+sorter.
+
+The operator is responsible for verifying that the equipment is assembled,
+configured, and operating safely. This software and its associated hardware
+are used at the operator's own risk and are provided without warranty.
+
+The ShibbyPrints Kiosk Edition is based on source code originally created by
+SJSeth Solutions and licensed under the GNU General Public License, version 3
+or later (GPL-3.0-or-later). Modifications for this edition were made through
+August 8, 2026.
+
+Copyright (C) 2026 SJSeth Solutions
+
+Copyright in later modifications remains with the respective contributors.
+The original project identifies SJSeth Solutions as its author.
+
+ShibbyPrints independently maintains this Kiosk Edition as an optional
+companion to the software and hardware ecosystem created by SJSeth Solutions.
+This edition is not an official SJSeth Solutions product. No sponsorship or
+endorsement by SJSeth Solutions is claimed or implied. Support for this Kiosk
+Edition is provided by ShibbyPrints.
+
+Original project:
+https://github.com/sjseth/AI-Case-Sorter-Py
+
+Upstream reference commit:
+62e879b0a57f3f857f59a8cc3e6e9ba701dc9bc9
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for details.
+
+The complete license terms are in the LICENSE file. This release contains the
+preferred form of the source code for modifying this version, including its
+Windows application build script.
+
+Bundled third-party libraries remain under their own licenses. Their license
+files must be distributed with the corresponding packaged libraries where
+required by those projects.

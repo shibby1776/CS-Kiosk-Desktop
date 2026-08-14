@@ -1,0 +1,28 @@
+{
+  "file_type": "shibbyprints.saved_bins",
+  "schema_version": 1,
+  "layout_name": "9mm Tula Norma Blazer SAR",
+  "caliber": "9mm",
+  "routing_mode": "headstamp",
+  "match_policy": "case_insensitive_exact",
+  "merge_policy": "preserve_unavailable",
+  "model_hint": "",
+  "assignments": [
+    {
+      "headstamp": "TULA",
+      "bin": 5
+    },
+    {
+      "headstamp": "NORMA",
+      "bin": 5
+    },
+    {
+      "headstamp": "BLAZER",
+      "bin": 7
+    },
+    {
+      "headstamp": "SAR",
+      "bin": 7
+    }
+  ]
+}

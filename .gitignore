@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+installer_output/
+build_report/
+*.spec.bak
+
+# Runtime data
+config/
+models/
+tmp/
+diagnostics/
+*.log
+*.partial
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

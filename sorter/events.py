@@ -1,0 +1,48 @@
+"""Thread-safe pub/sub used to marshal worker-thread events onto the Tk main thread.
+
+All worker threads (serial reader, camera grabber, HTTP worker) push (topic, payload)
+tuples onto a single Queue. The Tk main loop polls it via root.after().
+"""
+from __future__ import annotations
+
+import queue
+from collections import defaultdict
+from typing import Any, Callable
+
+
+class EventBus:
+    def __init__(self) -> None:
+        self._q: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._subs: dict[str, list[Callable[[Any], None]]] = defaultdict(list)
+
+    def subscribe(self, topic: str, handler: Callable[[Any], None]) -> None:
+        self._subs[topic].append(handler)
+
+    def unsubscribe(self, topic: str, handler: Callable[[Any], None]) -> None:
+        if handler in self._subs.get(topic, []):
+            self._subs[topic].remove(handler)
+
+    def post(self, topic: str, payload: Any = None) -> None:
+        """Called from any thread."""
+        self._q.put((topic, payload))
+
+    def drain(self, max_items: int = 64) -> int:
+        """Called from the Tk main thread. Returns count dispatched."""
+        count = 0
+        while count < max_items:
+            try:
+                topic, payload = self._q.get_nowait()
+            except queue.Empty:
+                break
+            for handler in list(self._subs.get(topic, [])):
+                try:
+                    handler(payload)
+                except Exception:
+                    pass
+            count += 1
+        return count
+
+
+def post_assignment_changed(bus: EventBus, source: str) -> None:
+    """Notify every Run surface that shared routing state changed."""
+    bus.post("run/assignment_changed", {"source": source})

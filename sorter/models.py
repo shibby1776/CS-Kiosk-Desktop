@@ -1,0 +1,332 @@
+"""Typed dataclasses for SQLite-backed entities.
+
+These mirror the legacy app's model / cartridge / headstamp / training-config
+shapes closely enough to make ZIP import/export and community download
+round-trips lossless. JSON-blob columns (`image_processing_json`,
+`training_config_json`, `ai_model_config_json`) on the `models` table hold the
+nested sub-objects so the SQL schema does not have to churn when those sub-
+objects gain fields.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any
+
+
+SUPPORTED_MODEL_MODES = (
+    "convnext_tiny",
+    "convnext_small",
+    "convnext_base",
+    "convnext_large",
+)
+
+MODEL_TYPES = ("Standard", "ReadOnly", "CommunityManaged")
+FEEDBACK_UPLOAD_MODES = ("Instant", "OnRunComplete", "Manual")
+
+
+def normalize_upload_mode(raw: Any, *, feedback_enabled: bool) -> str:
+    """Coerce a feedback upload-mode value to a canonical name string.
+
+    Accepts the canonical name (any case), the legacy enum int
+    (``Instant=0, OnRunComplete=1, Manual=2``), or a stringified int such as
+    ``"0"``. Unrecognized/missing values fall back to the publisher's usual
+    default (``Instant``) for a feedback-enabled model, else ``Manual``.
+
+    Applied on read (``Model.from_row``) and on import so legacy rows that
+    stored the raw enum int self-heal to the canonical string the upload-mode
+    comparisons expect.
+    """
+    if isinstance(raw, bool):
+        raw = None  # bool is an int subclass — never a valid mode
+    if isinstance(raw, str):
+        s = raw.strip()
+        for mode in FEEDBACK_UPLOAD_MODES:
+            if s.lower() == mode.lower():
+                return mode
+        if s.isdigit():
+            raw = int(s)  # "0" -> 0, handled by the int branch below
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        if 0 <= raw < len(FEEDBACK_UPLOAD_MODES):
+            return FEEDBACK_UPLOAD_MODES[raw]
+    return "Instant" if feedback_enabled else "Manual"
+
+
+@dataclass
+class Cartridge:
+    id: int | None = None
+    name: str = ""
+
+    @classmethod
+    def from_row(cls, row: Any) -> "Cartridge":
+        return cls(id=row["id"], name=row["name"])
+
+
+@dataclass
+class Headstamp:
+    id: int | None = None
+    name: str = ""
+    model_id: int = 0
+    slot: int = 0
+    # Parent classification grouping. None = unassigned (no parent). One parent
+    # per headstamp.
+    parent_id: int | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> "Headstamp":
+        keys = row.keys()
+        return cls(
+            id=row["id"],
+            name=row["name"],
+            model_id=row["model_id"],
+            slot=row["slot"] if "slot" in keys else 0,
+            parent_id=row["parent_id"] if "parent_id" in keys else None,
+        )
+
+
+@dataclass
+class HeadstampParent:
+    """A parent classification: a named group child headstamps roll up into.
+
+    Scoped to a single model so two models can reuse the same parent name
+    without collision. ``slot`` is
+    the physical bin this parent routes to when the model runs in parent-
+    classification mode (analogous to ``Headstamp.slot`` for child routing).
+    """
+    id: int | None = None
+    name: str = ""
+    model_id: int = 0
+    slot: int = 0
+
+    @classmethod
+    def from_row(cls, row: Any) -> "HeadstampParent":
+        keys = row.keys()
+        return cls(
+            id=row["id"],
+            name=row["name"],
+            model_id=row["model_id"],
+            slot=row["slot"] if "slot" in keys else 0,
+        )
+
+
+@dataclass
+class ImageProcessingConfig:
+    """Per-model image-processing settings.
+
+    Distinct from the app-level `image_proc` settings: the app-level ones tune
+    the default pipeline, this one overrides for a specific model when
+    `Model.enable_image_processing` is true.
+    """
+    strategy: str = "hough"
+    primer_mode: str = "hide"
+    primer_radius: int = 135
+    hough: dict[str, Any] = field(default_factory=lambda: {
+        "dp": 2.0,
+        "min_dist": 500,
+        "param1": 100,
+        "param2": 60,
+        "min_radius": 150,
+        "max_radius": 250,
+    })
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ImageProcessingConfig":
+        if not data:
+            return cls()
+        return cls(
+            strategy=data.get("strategy", "hough"),
+            primer_mode=data.get("primer_mode", "hide"),
+            primer_radius=int(data.get("primer_radius", 135)),
+            hough=dict(data.get("hough", cls().hough)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AIModelConfig:
+    """OpenAI-compatible HTTP endpoint settings, persisted per-model."""
+    endpoint_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    prompt: str = ""
+    image_quality: int = 100
+    image_scale: int = 100
+
+    # The legacy app's AI model config uses OpenAI_* keys; accept those
+    # alongside our snake_case ones so a community-imported model picks up the
+    # endpoint/prompt/quality settings on first activate.
+    _WINFORMS_ALIASES = {
+        "OpenAI_EndpointUrl": "endpoint_url",
+        "OpenAI_APIKey": "api_key",
+        "OpenAI_Model": "model",
+        "OpenAI_SystemPrompt": "prompt",
+        "ImageQuality": "image_quality",
+        "ImageScale": "image_scale",
+    }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AIModelConfig":
+        if not data:
+            return cls()
+        known = {f.name for f in fields(cls)}
+        normalised: dict[str, Any] = {}
+        for k, v in data.items():
+            if k in known:
+                normalised[k] = v
+            elif k in cls._WINFORMS_ALIASES:
+                normalised[cls._WINFORMS_ALIASES[k]] = v
+        return cls(**normalised)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TrainingConfig:
+    """27 fields mirroring the legacy app's training config.
+
+    Defaults follow the legacy defaults verbatim so an exported community
+    model is round-trippable without coercion.
+    """
+    model_name: str = "convnext_tiny"
+    image_directory: str = ""
+    output_model_path: str = ""
+
+    epochs: int = 10
+    learning_rate: float = 1e-4
+    batch_size: int = 32
+    weight_decay: float = 1e-4
+    val_split: float = 0.2
+    dropout_rate: float = 0.0
+    freeze_backbone: bool = False
+    use_workspace: bool = False
+    allow_gpu: bool = True
+    max_workers: int = -1
+    image_size: int = 232
+    train_all: bool = False
+
+    use_swa: bool = False
+    swa_start: float = 0.75
+    swa_mode: str = "scheduled"
+    swa_acc_threshold: float = 0.96
+    swa_patience: int = 5
+    swa_min_epoch: int = 10
+
+    use_focal_loss: bool = False
+    focal_gamma: float = 1.0
+    stochastic_depth_prob: float = -1.0
+
+    use_parent_classifications: bool = False
+
+    # Legacy PascalCase → our snake_case field name. Anything not in
+    # this map can still come in via snake_case and will be matched directly.
+    _WINFORMS_ALIASES = {
+        "ModelName": "model_name",
+        "ImageDirectory": "image_directory",
+        "OutputModelPath": "output_model_path",
+        "Epochs": "epochs",
+        "LearningRate": "learning_rate",
+        "BatchSize": "batch_size",
+        "WeightDecay": "weight_decay",
+        "ValSplit": "val_split",
+        "DropoutRate": "dropout_rate",
+        "FreezeBackbone": "freeze_backbone",
+        "UseWorkspace": "use_workspace",
+        "AllowGPU": "allow_gpu",
+        "MaxWorkers": "max_workers",
+        "ImageSize": "image_size",
+        "TrainAll": "train_all",
+        "UseSWA": "use_swa",
+        "SWAStart": "swa_start",
+        "SWAMode": "swa_mode",
+        "SWAAccThreshold": "swa_acc_threshold",
+        "SWAPatience": "swa_patience",
+        "SWAMinEpoch": "swa_min_epoch",
+        "UseFocalLoss": "use_focal_loss",
+        "FocalGamma": "focal_gamma",
+        "StochasticDepthProb": "stochastic_depth_prob",
+        "UseParentClassifications": "use_parent_classifications",
+    }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "TrainingConfig":
+        if not data:
+            return cls()
+        known = {f.name for f in fields(cls)}
+        normalised: dict[str, Any] = {}
+        for k, v in data.items():
+            if k in known:
+                normalised[k] = v
+            elif k in cls._WINFORMS_ALIASES:
+                normalised[cls._WINFORMS_ALIASES[k]] = v
+        return cls(**normalised)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Model:
+    id: int | None = None
+    name: str = ""
+    cartridge_id: int = 0
+    model_mode: str = "convnext_tiny"
+    model_type: str = "Standard"
+    community_model_uid: str | None = None
+    model_version: int = 1
+    enable_image_processing: bool = True
+    image_processing: ImageProcessingConfig = field(default_factory=ImageProcessingConfig)
+    training_config: TrainingConfig = field(default_factory=TrainingConfig)
+    ai_model_config: AIModelConfig = field(default_factory=AIModelConfig)
+    use_primer_mask: bool = False
+    hide_primer: bool = True
+    primer_mask_size: int = 135
+    last_training_date: str | None = None
+    last_training_duration: int = 0
+    trained_image_count: int = 0
+    training_confusion_table: str | None = None
+    feedback_loop_enabled: bool = False
+    feedback_loop_confidence_floor: int = 95
+    feedback_loop_upload_mode: str = "Manual"
+    model_path: str | None = None
+
+    @classmethod
+    def from_row(cls, row: Any) -> "Model":
+        import json
+
+        def _parse(s: str | None) -> dict[str, Any] | None:
+            if not s:
+                return None
+            try:
+                return json.loads(s)
+            except (TypeError, ValueError):
+                return None
+
+        return cls(
+            id=row["id"],
+            name=row["name"],
+            cartridge_id=row["cartridge_id"],
+            model_mode=row["model_mode"],
+            model_type=row["model_type"],
+            community_model_uid=row["community_model_uid"],
+            model_version=row["model_version"],
+            enable_image_processing=bool(row["enable_image_processing"]),
+            image_processing=ImageProcessingConfig.from_dict(_parse(row["image_processing_json"])),
+            training_config=TrainingConfig.from_dict(_parse(row["training_config_json"])),
+            ai_model_config=AIModelConfig.from_dict(_parse(row["ai_model_config_json"])),
+            use_primer_mask=bool(row["use_primer_mask"]),
+            hide_primer=bool(row["hide_primer"]),
+            primer_mask_size=row["primer_mask_size"],
+            last_training_date=row["last_training_date"],
+            last_training_duration=row["last_training_duration"],
+            trained_image_count=row["trained_image_count"],
+            training_confusion_table=row["training_confusion_table"],
+            feedback_loop_enabled=bool(row["feedback_loop_enabled"]),
+            feedback_loop_confidence_floor=row["feedback_loop_confidence_floor"],
+            feedback_loop_upload_mode=normalize_upload_mode(
+                row["feedback_loop_upload_mode"],
+                feedback_enabled=bool(row["feedback_loop_enabled"]),
+            ),
+            model_path=row["model_path"],
+        )

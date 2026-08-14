@@ -1,0 +1,48 @@
+[project]
+name = "shibbyprints-ai-case-sorter-desktop"
+version = "1.27.15"
+description = "Cross-platform desktop app that sorts spent brass cartridge casings by headstamp using a camera, an image classifier, and a serial-connected sorting machine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "SJSeth Solutions" }]
+maintainers = [{ name = "ShibbyPrints" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "pyserial>=3.5",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "requests>=2.31",
+    "msal>=1.28",
+    "platformdirs>=4.0",
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "pygrabber>=0.2; platform_system == 'Windows'",
+    "comtypes>=1.2; platform_system == 'Windows'",
+]
+
+[project.urls]
+"Desktop Edition" = "https://www.shibbyprints.com/"
+"Original Source" = "https://github.com/sjseth/AI-Case-Sorter-Py"
+
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["sorter", "sorter.ui", "sorter.training"]
