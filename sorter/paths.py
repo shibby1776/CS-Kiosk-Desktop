@@ -40,6 +40,16 @@ def models_dir() -> Path:
     return app_data_dir() / "models"
 
 
+def crash_reports_dir() -> Path:
+    """Private bounded logs used for recovery after an unexpected failure."""
+    return app_data_dir() / "crash_reports"
+
+
+def logs_dir() -> Path:
+    """Bounded operational logs that survive application restarts."""
+    return app_data_dir() / "logs"
+
+
 def export_temp_dir() -> Path:
     return app_data_dir() / "tmp"
 
@@ -91,6 +101,8 @@ def ensure_directories() -> None:
         app_data_dir(),
         config_dir(),
         models_dir(),
+        crash_reports_dir(),
+        logs_dir(),
         saved_bins_dir(),
     ):
         directory.mkdir(parents=True, exist_ok=True)

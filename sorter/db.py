@@ -19,7 +19,34 @@ from typing import Any, Iterator
 from . import paths
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
+
+# SQLite's CREATE TABLE IF NOT EXISTS does not update an existing table. Keep
+# every post-v1 model column here so an upgrade repairs the actual table shape
+# rather than trusting a version stamp that may have advanced too early.
+MODEL_COLUMN_DEFINITIONS = {
+    "model_type": "TEXT NOT NULL DEFAULT 'Standard'",
+    "community_model_uid": "TEXT",
+    "model_version": "INTEGER NOT NULL DEFAULT 1",
+    "enable_image_processing": "INTEGER NOT NULL DEFAULT 1",
+    "image_processing_json": "TEXT",
+    "training_config_json": "TEXT",
+    "ai_model_config_json": "TEXT",
+    "use_primer_mask": "INTEGER NOT NULL DEFAULT 0",
+    "hide_primer": "INTEGER NOT NULL DEFAULT 1",
+    "primer_mask_size": "INTEGER NOT NULL DEFAULT 135",
+    "last_training_date": "TEXT",
+    "last_training_duration": "INTEGER NOT NULL DEFAULT 0",
+    "trained_image_count": "INTEGER NOT NULL DEFAULT 0",
+    "training_confusion_table": "TEXT",
+    "feedback_loop_enabled": "INTEGER NOT NULL DEFAULT 0",
+    "feedback_loop_confidence_floor": "INTEGER NOT NULL DEFAULT 95",
+    "feedback_loop_upload_mode": "TEXT NOT NULL DEFAULT 'Manual'",
+    "model_path": "TEXT",
+    "checkpoint_env_json": "TEXT",
+    "created_at": "TEXT",
+    "updated_at": "TEXT",
+}
 
 SCHEMA_DDL = """
 PRAGMA foreign_keys = ON;
@@ -55,10 +82,26 @@ CREATE TABLE IF NOT EXISTS models (
   feedback_loop_confidence_floor INTEGER NOT NULL DEFAULT 95,
   feedback_loop_upload_mode TEXT NOT NULL DEFAULT 'Manual',
   model_path TEXT,
+  checkpoint_env_json TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_models_cartridge ON models(cartridge_id);
+
+-- Stable network-facing names for models served by the integrated API.
+-- The alias points to the local model row rather than a copied/renamed
+-- checkpoint, so community updates that retain the model id also retain the
+-- server assignment.  RESTRICT prevents a served model from disappearing
+-- without an explicit technician action.
+CREATE TABLE IF NOT EXISTS api_model_aliases (
+  alias TEXT PRIMARY KEY COLLATE NOCASE,
+  model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE RESTRICT,
+  preload INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_api_model_alias_model
+  ON api_model_aliases(model_id);
 
 -- Parent classifications: named groups that child headstamps roll up into.
 -- Scoped per-model.
@@ -97,6 +140,69 @@ DEFAULT_MODEL_NAME = "Default"
 DEFAULT_MODEL_MODE = "convnext_tiny"
 
 
+class _LockedCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        with self.connection.access_lock:
+            super().execute(sql, parameters)
+            self._pending = iter(super().fetchall() if self.description else [])
+        return self
+
+    def executemany(self, sql, parameters):
+        with self.connection.access_lock:
+            super().executemany(sql, parameters)
+            self._pending = iter([])
+        return self
+
+    def executescript(self, sql):
+        with self.connection.access_lock:
+            super().executescript(sql)
+            self._pending = iter([])
+        return self
+
+    def fetchone(self):
+        return next(self._pending, None)
+
+    def fetchall(self):
+        return list(self._pending)
+
+    def fetchmany(self, size=None):
+        import itertools
+        return list(itertools.islice(self._pending, self.arraysize if size is None else size))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._pending)
+
+
+class _LockedConnection(sqlite3.Connection):
+    def cursor(self, factory=_LockedCursor):
+        with self.access_lock:
+            return super().cursor(factory)
+
+    def execute(self, sql, parameters=()):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, parameters):
+        return self.cursor().executemany(sql, parameters)
+
+    def executescript(self, sql):
+        return self.cursor().executescript(sql)
+
+    def commit(self):
+        with self.access_lock:
+            return super().commit()
+
+    def rollback(self):
+        with self.access_lock:
+            return super().rollback()
+
+    def close(self):
+        with self.access_lock:
+            return super().close()
+
+
 class Database:
     """Owns a single sqlite3.Connection for the lifetime of the app."""
 
@@ -109,9 +215,8 @@ class Database:
         # that same thread" by default; check_same_thread=False allows the
         # cross-thread access and this RLock serialises multi-statement
         # transactions so two threads can't interleave a BEGIN/COMMIT pair.
-        # Single-statement execute() calls are atomic at the SQLite layer
-        # so they don't need the lock, but transaction() / SAVEPOINT blocks
-        # do.
+        # Every execution and its result materialization uses this same lock.
+        # Standalone repository calls cannot enter another thread's transaction.
         self._lock = threading.RLock()
 
     @property
@@ -127,7 +232,9 @@ class Database:
                 self.path,
                 isolation_level=None,
                 check_same_thread=False,
+                factory=_LockedConnection,
             )
+            self._conn.access_lock = self._lock
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
         return self._conn
@@ -183,13 +290,14 @@ class Database:
             stmt = stmt.strip()
             if stmt:
                 conn.execute(stmt)
-        # Bring pre-existing tables up to the current shape. CREATE TABLE IF NOT
-        # EXISTS leaves an already-present `headstamps` table untouched, so new
-        # columns are added here with ALTER instead.
-        self._apply_column_migrations(conn)
-        current_version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if current_version < SCHEMA_VERSION:
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        # Apply all structural repairs and advance the stamp atomically. The
+        # table shape is authoritative; an incorrect current stamp cannot hide
+        # an incomplete older schema.
+        with self.transaction():
+            self._apply_column_migrations(conn)
+            current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current_version < SCHEMA_VERSION:
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
         if was_fresh:
             if legacy_config_json and Path(legacy_config_json).exists():
@@ -206,9 +314,12 @@ class Database:
         is safe to call on every startup (fresh DBs already have the column
         from the DDL and skip the ALTER).
         """
-        headstamp_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(headstamps)").fetchall()
-        }
+        model_cols = self._columns(conn, "models")
+        for name, definition in MODEL_COLUMN_DEFINITIONS.items():
+            if name not in model_cols:
+                conn.execute(f"ALTER TABLE models ADD COLUMN {name} {definition}")
+
+        headstamp_cols = self._columns(conn, "headstamps")
         if "parent_id" not in headstamp_cols:
             # NULL default keeps this a legal ALTER even with a REFERENCES clause.
             conn.execute(
@@ -216,13 +327,18 @@ class Database:
                 "REFERENCES headstamp_parents(id) ON DELETE SET NULL"
             )
 
-        parent_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(headstamp_parents)").fetchall()
-        }
+        parent_cols = self._columns(conn, "headstamp_parents")
         if parent_cols and "slot" not in parent_cols:
             conn.execute(
                 "ALTER TABLE headstamp_parents ADD COLUMN slot INTEGER NOT NULL DEFAULT 0"
             )
+
+    @staticmethod
+    def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        return {
+            str(row[1])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
 
     def _migrate_from_json(self, json_path: Path) -> None:
         """One-shot import. Reads `config.json`, writes rows, renames to `.bak`."""

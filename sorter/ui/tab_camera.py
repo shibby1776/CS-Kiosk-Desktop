@@ -204,7 +204,7 @@ class CameraTab(ttk.Frame):
         # the probe can open each device.
         self.app.stop_camera()
         self.app.run_worker(
-            camera_mod.list_cameras_with_metadata,
+            self.app.detect_cameras,
             on_done=self._startup_detect_done,
             on_error=self._startup_detect_failed,
         )
@@ -251,7 +251,7 @@ class CameraTab(ttk.Frame):
         # Release the live camera so the probe can open each device.
         self.app.stop_camera()
         self.app.run_worker(
-            camera_mod.list_cameras_with_metadata,
+            self.app.detect_cameras,
             on_done=self._detect_done,
             on_error=self._detect_failed,
         )
@@ -365,6 +365,8 @@ class CameraTab(ttk.Frame):
             return
 
         wh = _parse_resolution(self.resolution_var.get())
+        from ..transports.network import validate_camera_mode
+        validate_camera_mode(getattr(self.app, 'broker', None), *(wh or (None, None)))
         self.config.camera["device_index"] = int(cam["index"])
         self.config.camera["device_chosen"] = True
         self.config.camera["prefer_by_usb_id"] = bool(self.prefer_usb_var.get())

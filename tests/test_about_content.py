@@ -13,7 +13,7 @@ class AboutContentTests(unittest.TestCase):
         self.assertIn('self.root.title("ShibbyPrints Kiosk Sorter — Desktop")', self.source)
         self.assertIn('window.title("About ShibbyPrints Kiosk Sorter")', self.source)
         self.assertIn('text="ShibbyPrints Kiosk Sorter Software"', self.source)
-        self.assertIn('text=f"Kiosk {PUBLIC_VERSION_NUMBER}"', self.source)
+        self.assertIn('text=PUBLIC_VERSION', self.source)
         self.assertNotIn(
             'text=f"Kiosk {PUBLIC_VERSION_NUMBER} Desktop"', self.source
         )

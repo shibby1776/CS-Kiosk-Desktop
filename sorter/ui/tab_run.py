@@ -28,7 +28,7 @@ from collections import defaultdict
 from tkinter import messagebox, ttk
 from typing import Callable
 
-from ..events import EventBus, post_assignment_changed
+from ..events import EventBus, plan_assignment_refresh, post_assignment_changed
 from ..feedback import FeedbackService, debug_log, is_feedback_model
 from ..repository import ModelRepo
 from .theme import PALETTE
@@ -77,7 +77,11 @@ class FlowGrid(ttk.Frame):
         self.bind("<Configure>", self._on_configure)
 
     def add(self, cell: tk.Widget) -> None:
+        """Add a cell without repeatedly laying out all preceding cells."""
         self._cells.append(cell)
+
+    def finish(self) -> None:
+        """Lay out a completed batch of cells exactly once."""
         self._reflow(force=True)
 
     def clear(self) -> None:
@@ -322,7 +326,7 @@ class SlotDetailsPanel(ttk.LabelFrame):
         parent: tk.Misc,
         *,
         config,
-        on_assignment_change: Callable[[], None],
+        on_assignment_change: Callable[[dict], None],
     ):
         super().__init__(parent, text="Slot details", padding=8)
         self.config_obj = config
@@ -506,6 +510,7 @@ class SlotDetailsPanel(ttk.LabelFrame):
                 assigned=int(hs["slot"]),
                 on_toggle=lambda var, n=name: self._toggle_headstamp(n, var),
             )
+        grid.finish()
 
     def _build_package_mode(
         self, slot_num: int, headstamps: list[dict], needle: str,
@@ -530,13 +535,18 @@ class SlotDetailsPanel(ttk.LabelFrame):
             )
             grid.add(cell)
             self._cells_by_source[name].append(cell)
+        grid.finish()
 
     def _toggle_package_headstamp(self, name: str, var: tk.BooleanVar) -> None:
         if self.current_slot is None or self.current_slot == 0:
             return
         self.config_obj.set_package_slot_headstamp(self.current_slot, name, var.get())
-        self.show_slot(self.current_slot)
-        self.on_assignment_change()
+        self.on_assignment_change({
+            "full_refresh": False,
+            "kind": "package_headstamp",
+            "name": name,
+            "slot": self.current_slot,
+        })
 
     def _build_parent_mode(
         self, slot_num: int, parents: list[dict], headstamps: list[dict], needle: str,
@@ -567,6 +577,7 @@ class SlotDetailsPanel(ttk.LabelFrame):
                 assigned=int(hs["slot"]),
                 on_toggle=lambda var, n=name: self._toggle_headstamp(n, var),
             )
+        grid.finish()
 
     def _build_grouped_mode(
         self, slot_num: int, parents: list[dict], headstamps: list[dict], needle: str,
@@ -597,6 +608,7 @@ class SlotDetailsPanel(ttk.LabelFrame):
                         assigned=int(k["slot"]),
                         on_toggle=lambda var, n=k["name"]: self._toggle_headstamp(n, var),
                     )
+                grid.finish()
 
         visible_orphans = sorted(
             (o for o in orphans if not needle or needle in o["name"].casefold()),
@@ -611,6 +623,7 @@ class SlotDetailsPanel(ttk.LabelFrame):
                     assigned=int(o["slot"]),
                     on_toggle=lambda var, n=o["name"]: self._toggle_headstamp(n, var),
                 )
+            grid.finish()
 
     def _build_group_header(self, slot_num: int, parent: dict, kids: list[dict]) -> None:
         name = parent["name"]
@@ -659,17 +672,28 @@ class SlotDetailsPanel(ttk.LabelFrame):
         if self.current_slot is None or self.current_slot == 0:
             return
         new_slot = self.current_slot if var.get() else 0
-        self.config_obj.set_headstamp_slot(name, new_slot)
-        self.show_slot(self.current_slot)
-        self.on_assignment_change()
+        if not self.config_obj.set_headstamp_slot(name, new_slot):
+            var.set(not var.get())
+            return
+        self.on_assignment_change({
+            "full_refresh": False,
+            "kind": "headstamp",
+            "name": name,
+            "slot": self.current_slot,
+        })
 
     def _toggle_parent(self, parent_id: int, var: tk.BooleanVar) -> None:
         if self.current_slot is None or self.current_slot == 0:
             return
         new_slot = self.current_slot if var.get() else 0
-        self.config_obj.set_parent_slot(parent_id, new_slot)
-        self.show_slot(self.current_slot)
-        self.on_assignment_change()
+        if not self.config_obj.set_parent_slot(parent_id, new_slot):
+            var.set(not var.get())
+            return
+        self.on_assignment_change({
+            "full_refresh": False,
+            "kind": "parent",
+            "slot": self.current_slot,
+        })
 
     def _toggle_group(self, kids: list[dict], var: tk.BooleanVar) -> None:
         """Assign/clear a parent group's children for this slot.
@@ -686,7 +710,11 @@ class SlotDetailsPanel(ttk.LabelFrame):
                 continue  # locked elsewhere
             self.config_obj.set_headstamp_slot(k["name"], target)
         self.show_slot(self.current_slot)
-        self.on_assignment_change()
+        self.on_assignment_change({
+            "full_refresh": False,
+            "kind": "headstamp_group",
+            "slot": self.current_slot,
+        })
 
     def _toggle_collapse(self, name: str) -> None:
         if name in self._collapsed:
@@ -725,6 +753,7 @@ class RunTab(ttk.Frame):
         self._store_warning_shown = False
         self._monitor_window = None
         self._saved_bins_dialog = None
+        self._assignments_dirty = False
 
         # Community feedback-loop upload state.
         self._feedback = (
@@ -973,7 +1002,7 @@ class RunTab(ttk.Frame):
         bus.subscribe("run/result", self._on_result)
         bus.subscribe("run/package_full", self._on_package_full)
         bus.subscribe("run/package_halt", self._on_package_halt)
-        bus.subscribe("run/assignment_changed", lambda _p: self._on_assignment_changed())
+        bus.subscribe("run/assignment_changed", self._on_assignment_changed)
         bus.subscribe("run/headstamps_synced", self._on_headstamps_synced)
         bus.subscribe("run/headstamps_sync_warning", self._on_headstamps_sync_warning)
         # Headstamps are scoped to the active model, so refresh the slot
@@ -1065,8 +1094,9 @@ class RunTab(ttk.Frame):
             card.set_package_mode(package)
             self.slot_grid.add(card)
             self._slot_cards.append(card)
+        self.slot_grid.finish()
 
-    def _refresh_card_headstamps(self) -> None:
+    def _refresh_card_headstamps(self, slots: set[int] | None = None) -> None:
         # Build slot -> [label] mapping for slots 1..N. In parent mode the
         # labels are parent groups + ungrouped headstamps; otherwise they are
         # individual headstamps.
@@ -1076,6 +1106,8 @@ class RunTab(ttk.Frame):
                 if slot > 0 and names:
                     slot_map[slot].extend(names)
             for card in self._slot_cards:
+                if slots is not None and card.slot_number not in slots:
+                    continue
                 card.set_headstamps(
                     sorted(slot_map.get(card.slot_number, []), key=str.casefold)
                 )
@@ -1095,6 +1127,8 @@ class RunTab(ttk.Frame):
                 if name and slot > 0:
                     slot_map[slot].append(name)
         for card in self._slot_cards:
+            if slots is not None and card.slot_number not in slots:
+                continue
             card.set_headstamps(sorted(slot_map.get(card.slot_number, []), key=str.casefold))
 
     def _update_parent_option_visibility(self) -> None:
@@ -1239,17 +1273,50 @@ class RunTab(ttk.Frame):
             self, app=self.app, config=self.config
         )
 
-    def _on_assignment_changed(self) -> None:
-        """Auto-select assigned a headstamp to a slot during a run."""
-        self._refresh_card_headstamps()
-        if self.details.current_slot is not None:
+    def _is_visible(self) -> bool:
+        if not self.app._maintenance_mode:
+            return False
+        try:
+            return self.app.notebook.select() == str(self.app._run_tab_container)
+        except tk.TclError:
+            return False
+
+    def _on_assignment_changed(
+        self, payload: dict | None = None, *, force: bool = False
+    ) -> None:
+        """Refresh only the visible routing widgets that actually changed."""
+        action, slots = plan_assignment_refresh(
+            payload,
+            visible=self._is_visible(),
+            local_source="maintenance_",
+            force=force,
+        )
+        if action == "defer":
+            self._assignments_dirty = True
+            return
+        if action == "skip":
+            return  # the click handler already updated this visible surface
+
+        self._assignments_dirty = False
+        self._refresh_card_headstamps(slots)
+        if action == "full" and self.details.current_slot is not None:
             self.details.show_slot(self.details.current_slot)
 
+    def refresh_if_dirty(self) -> None:
+        if self._assignments_dirty and self._is_visible():
+            self._on_assignment_changed(force=True)
+
     def _notify_assignment_changed(
-        self, source: str = "maintenance_manual"
+        self,
+        change: dict | None = None,
+        source: str = "maintenance_manual",
     ) -> None:
         """Publish a Maintenance routing change to every Run surface."""
-        post_assignment_changed(self.bus, source)
+        if source == "maintenance_manual":
+            changed_slot = (change or {}).get("slot")
+            slots = {changed_slot} if isinstance(changed_slot, int) else None
+            self._refresh_card_headstamps(slots)
+        post_assignment_changed(self.bus, source, change)
 
     def _on_package_full(self, payload: dict) -> None:
         slot = payload.get("slot")
@@ -1329,6 +1396,11 @@ class RunTab(ttk.Frame):
     def _on_feedback_queued(self, payload: dict) -> None:
         """A below-threshold image was staged during a run. Upload now in
         Instant mode; otherwise just refresh the manual button."""
+        # This constructed Run tab is the automatic-upload owner even when LAN
+        # Access is also running. WindowsWebOperations explicitly defers while
+        # app.run_tab exists, so Desktop + Web presentation still has exactly
+        # one queue drainer. In browser-only operation this tab is never
+        # constructed and the web adapter owns the same event instead.
         model_id = payload.get("model_id")
         mode = payload.get("upload_mode")
         declined = model_id in self._feedback_declined_models

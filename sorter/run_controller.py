@@ -6,6 +6,7 @@ post UI update. Loops until Stop pressed.
 """
 from __future__ import annotations
 
+from functools import wraps
 import threading
 import time
 import traceback
@@ -22,19 +23,42 @@ from .training.dataset import save_training_image
 
 
 SlotCallback = Callable[[int], None]
+DISCONNECT_ERROR = "Serial disconnected"
 
+
+def _exclusive_manual(method):
+    @wraps(method)
+    def call(self,*args,**kwargs):
+        if not self._operation_lock.acquire(blocking=False):
+            return {'ok':False,'error':'An operation is already in progress'}
+        self.broker.run_active=True
+        try:return method(self,*args,**kwargs)
+        finally:self.broker.run_active=False;self._operation_lock.release()
+    return call
 
 class RunController:
-    def __init__(self, *, config: Config, broker, camera, bus: EventBus, db: Any = None, diagnostics: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        config: Config,
+        broker,
+        camera,
+        bus: EventBus,
+        db: Any = None,
+        diagnostics: Any = None,
+        crash_reporter: Any = None,
+    ) -> None:
         self.config = config
         self.broker = broker
         self.camera = camera
         self.bus = bus
         self.db = db
         self.diagnostics = diagnostics
+        self.crash_reporter = crash_reporter
         self._feedback = FeedbackService(db) if db is not None else None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._operation_lock = threading.Lock()
         # Package-mode batch counters: slot -> cases dropped this run. Owned by
         # the run thread but read/reset from the UI thread (live reset button),
         # so every access is guarded. The catch-all (0) is never batched.
@@ -48,6 +72,9 @@ class RunController:
         # in the right slot. Default 0 (catch-all) on a fresh controller —
         # the first Manual feed click or continuous Run prime sends that.
         self._last_classified_slot = 0
+        # A manually classified case is reported only after a later feed/prime
+        # acknowledges its drop. Empty or untracked primes cannot be counted.
+        self._pending_drop_report = None
         # Sequence sampled immediately after the board reports movement done.
         # The next classification waits for one newer preview frame.
         self._next_capture_after_sequence: int | None = None
@@ -55,19 +82,57 @@ class RunController:
         # Remote labels are synchronized once per endpoint/model combination.
         # Existing names and their physical slot assignments are preserved.
         self._remote_labels_signature: tuple[str, str] | None = None
+        if hasattr(self.broker, "on_waiting"):
+            self.broker.on_waiting.append(self._on_waiting_for_brass)
+
+    def _on_waiting_for_brass(self, _line: str) -> None:
+        if self.is_running:
+            self.bus.post("run/status", "Waiting for brass at the feed sensor…")
+
+    def _record_event(self, event: str, detail: str = "") -> None:
+        if self.crash_reporter is not None:
+            self.crash_reporter.record_event(event, detail)
+
+    def _drop_report(self, label, confidence, slot, above_floor):
+        config = self.config
+        model_id = config.settings.get_active_model_id()
+        return {
+            "label": str(label or ""), "confidence": confidence, "slot": slot,
+            "reason": "below_confidence_floor" if not above_floor else "unassigned",
+            "sorter_connection": str(config.serial.get("port") or "Unknown"),
+            "model": str(config.api.get("model") or "Unknown") if model_id is None else f"Local model {model_id}",
+        }
+
+    def _report_pending_drop(self):
+        pending = getattr(self, "_pending_drop_report", None)
+        if pending is not None:
+            self.bus.post("run/dropped", {**pending, "acknowledged": True})
+            self._pending_drop_report = None
+
+    def _record_exception(self, exc: BaseException, source: str) -> None:
+        if self.crash_reporter is not None:
+            self.crash_reporter.record_exception(
+                type(exc), exc, exc.__traceback__, source=source, notify=True
+            )
 
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def operation_busy(self):return self._operation_lock.locked()
+
     def start(self) -> None:
         if self.is_running:
             return
+        if not self._operation_lock.acquire(blocking=False):return
+        self.broker.run_active=True
         self._stop_event.clear()
         # NB: package batch counters are intentionally NOT reset here — a run
         # that's stopped and restarted resumes its batches where it left off.
         # They clear only via the Reset counters button or a per-slot reset.
         self._thread = threading.Thread(target=self._loop, name="RunController", daemon=True)
+        self._record_event("sorting_started")
         self._thread.start()
         self.bus.post("run/started", None)
 
@@ -88,6 +153,7 @@ class RunController:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._record_event("sorting_stop_requested")
         try:
             self.broker.stop_run()
         except Exception:
@@ -115,6 +181,10 @@ class RunController:
             # otherwise valid classification request from running. The normal
             # classify call will still report its own server failure if needed.
             self.bus.post("run/headstamps_sync_warning", str(exc))
+            self._record_event(
+                "remote_headstamp_sync_failed",
+                f"{type(exc).__name__}: {exc}",
+            )
             # Do not cache failures. A transient network/auth/server problem
             # must be retried on the next Start or Manual Feed action.
             return
@@ -134,6 +204,15 @@ class RunController:
         if label and self.config.use_parent_classifications:
             return self.config.parent_for_headstamp(label)
         return None
+
+    def _board_error(self, timeout_message: str) -> str:
+        """Distinguish an unavailable board from a slow command response."""
+        if not getattr(self.broker, "is_connected", True):
+            return DISCONNECT_ERROR
+        operation_error = str(getattr(self.broker, "last_operation_error", "") or "")
+        if operation_error:
+            return operation_error
+        return timeout_message
 
     def _above_floor(self, confidence: float) -> bool:
         floor = self.config.run_confidence_floor
@@ -264,13 +343,36 @@ class RunController:
         except Exception:
             traceback.print_exc()
 
-    def _maybe_capture_feedback(self, image_bgr, label: str, confidence: float) -> None:
-        """Stage a below-threshold prediction for the community feedback loop.
+    def refresh_community_feedback(self, *, auth: Any) -> Any:
+        """Refresh publisher policy and wish-list state before sorting.
 
-        Independent of the run confidence floor — feedback uses the publisher's
-        own threshold (``model.feedback_loop_confidence_floor``). Best-effort;
-        a failure here never interrupts a run. Posts ``feedback/queued`` so the
-        Run tab (which holds the auth token) can drive the upload.
+        This performs network I/O and must be called from a worker or request
+        thread. Failures return to the installed model's local confidence rule.
+        """
+        if self._feedback is None:
+            return None
+        model_id = self.config.settings.get_active_model_id()
+        model = ModelRepo(self.db).get(model_id) if model_id is not None else None
+        return self._feedback.refresh_server_settings(model, auth=auth)
+
+    def clear_community_feedback(self) -> None:
+        if self._feedback is not None:
+            self._feedback.clear_server_settings()
+            self._feedback.clear_wish_list()
+
+    def _maybe_capture_feedback(
+        self,
+        image_bgr,
+        label: str,
+        confidence: float,
+        *,
+        wish_list: bool = False,
+    ) -> None:
+        """Stage a prediction for the community feedback loop.
+
+        Independent of the run confidence floor: feedback uses the publisher's
+        current server policy, plus the classification wish list during a
+        continuous run. Best-effort; a failure never interrupts sorting.
         """
         if self._feedback is None or image_bgr is None:
             debug_log(
@@ -284,7 +386,12 @@ class RunController:
         debug_log(f"run-hook: model_id={model_id} label={label!r} confidence={confidence}")
         try:
             model = ModelRepo(self.db).get(model_id)
-            if not self._feedback.should_capture(model, confidence):
+            if not self._feedback.should_capture(
+                model,
+                confidence,
+                label,
+                wish_list=wish_list,
+            ):
                 return
             if self._feedback.capture(model, image_bgr, label, confidence):
                 debug_log(
@@ -330,6 +437,7 @@ class RunController:
 
     # ----- one iteration ------------------------------------------------------
 
+    @_exclusive_manual
     def test_once(self) -> dict[str, Any]:
         """Feed → capture → crop → classify. No sort, no slot routing.
 
@@ -358,7 +466,7 @@ class RunController:
         try:
             self.bus.post("test/status", "Feeding…")
             if not self.broker.feed_one():
-                return _fail("Feed timeout")
+                return _fail(self._board_error("Feed timeout"))
             self._mark_motion_complete()
             self.bus.post("test/status", "Capturing & cropping…")
             frame, capture_metadata = self._capture_post_motion_frame()
@@ -495,8 +603,11 @@ class RunController:
             slot, above_floor, halt = self._resolve_destination(label, confidence)
             result["slot"] = slot
             result["halt"] = halt
+            drop_report = self._drop_report(label, confidence, slot, above_floor) if slot == 0 else None
             self._maybe_store_run_image(cropped, label, above_floor)
-            self._maybe_capture_feedback(cropped, label, confidence)
+            self._maybe_capture_feedback(
+                cropped, label, confidence, wish_list=True
+            )
             # Track the latest classification so a follow-up Manual feed or
             # the next continuous-run prime can route the case still queued
             # at position 5 instead of defaulting back to 0.
@@ -513,10 +624,15 @@ class RunController:
             # next case into the imaging area before responding 'done'. The
             # next iteration's capture will see that next case.
             if not self.broker.sort_and_move(slot):
-                result["error"] = "Sort timeout"
+                if self._stop_event.is_set():
+                    result["cancelled"] = True
+                    return result
+                result["error"] = self._board_error("Sort timeout")
                 return result
             self._mark_motion_complete()
             # Tally the batch only once the case has physically dropped.
+            if drop_report is not None:
+                self.bus.post("run/dropped", {**drop_report, "acknowledged": True})
             self._commit_package_count(slot, label, above_floor)
 
             result["ok"] = True
@@ -524,10 +640,12 @@ class RunController:
         except Exception as exc:
             result["error"] = str(exc) or exc.__class__.__name__
             traceback.print_exc()
+            self._record_exception(exc, "continuous_run_cycle")
             return result
 
     # ----- continuous loop ----------------------------------------------------
 
+    @_exclusive_manual
     def cycle_once(self) -> dict[str, Any]:
         """Manual feed: rotate the wheel, then capture + classify the new case.
 
@@ -546,17 +664,20 @@ class RunController:
             "slot": None, "cropped": None, "error": None,
         }
         try:
+            self._check_inference_ready()
             slot_to_send = self._last_classified_slot
             self.bus.post("run/status", f"Feeding (slot {slot_to_send})…")
             # force_sort_and_move (xf:<slot>) rotates the wheel and drops
             # position 5's case at the given slot. Handles both the
             # empty-wheel first call and the normal primed state.
             if not self.broker.force_sort_and_move(slot_to_send):
-                result["error"] = "Feed timeout"
+                result["error"] = self._board_error("Feed timeout")
+                self._record_event("manual_run_error", result["error"])
                 self.bus.post("run/result", result)
                 self.bus.post("run/error", result["error"])
                 return result
             self._mark_motion_complete()
+            self._report_pending_drop()
             self.bus.post("run/status", "Capturing & cropping…")
             frame, capture_metadata = self._capture_post_motion_frame()
             if self.diagnostics is not None:
@@ -569,6 +690,7 @@ class RunController:
                     traceback.print_exc()
             if frame is None:
                 result["error"] = "Camera capture failed"
+                self._record_event("manual_run_error", result["error"])
                 self.bus.post("run/result", result)
                 self.bus.post("run/error", result["error"])
                 return result
@@ -618,16 +740,30 @@ class RunController:
             self._post_history(result)
             # Stash for the next Manual feed click or continuous Run prime.
             self._last_classified_slot = slot
+            self._pending_drop_report = self._drop_report(label, confidence, slot, above_floor) if slot == 0 else None
         except Exception as exc:
             traceback.print_exc()
             result["error"] = str(exc) or exc.__class__.__name__
+            self._record_exception(exc, "manual_run_cycle")
         self.bus.post("run/result", result)
         if result.get("error"):
             self.bus.post("run/error", result["error"])
         return result
 
+    def _check_inference_ready(self):
+        if self.db is not None and not classifier.uses_local_backend(self.db):
+            from .api_client import ensure_ready
+            self.bus.post('run/status','Checking inference server and model before movement…')
+            ensure_ready(self.config.api)
+
     def _loop(self) -> None:
         try:
+            try:
+                self._check_inference_ready()
+            except Exception as exc:
+                self.bus.post('run/error', str(exc))
+                self._record_event('inference_not_ready', str(exc))
+                return
             # Prime: rotate the wheel once with the last-known classification
             # slot. If Manual feed (or an earlier run) left a stored slot,
             # we use it so the case still queued at position 5 gets routed
@@ -636,13 +772,20 @@ class RunController:
             prime_slot = self._last_classified_slot
             self.bus.post("run/status", f"Priming feed (slot {prime_slot})…")
             if not self.broker.force_sort_and_move(prime_slot):
-                self.bus.post("run/error", "Initial feed timeout")
+                if self._stop_event.is_set():
+                    return
+                message = self._board_error("Initial feed timeout")
+                self._record_event("sorting_error", message)
+                self.bus.post("run/error", message)
                 return
             self._mark_motion_complete()
 
+            self._report_pending_drop()
             while not self._stop_event.is_set():
                 result = self.run_once()
                 self.bus.post("run/result", result)
+                if result.get("cancelled") and self._stop_event.is_set():
+                    break
                 if result.get("error"):
                     if result.get("retryable") and not self._stop_event.is_set():
                         self.bus.post("run/status", "Waiting for a fresh camera frame; retrying the same case…")
@@ -659,6 +802,7 @@ class RunController:
                         # Do not move the wheel. Capture/classify the same case again.
                         continue
                     self.bus.post("run/error", result["error"])
+                    self._record_event("sorting_error", result["error"])
                     break
                 if result.get("halt"):
                     # Every slot for this headstamp is full — stop and notify.
@@ -671,4 +815,7 @@ class RunController:
                 if self._stop_event.wait(timeout=0.05):
                     break
         finally:
+            self.broker.run_active=False
+            self._operation_lock.release()
+            self._record_event("sorting_stopped")
             self.bus.post("run/stopped", None)

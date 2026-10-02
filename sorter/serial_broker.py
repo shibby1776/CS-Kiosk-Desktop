@@ -5,8 +5,9 @@ the public command surface (feed_one, force_sort_and_move, sort_and_move,
 get_config, update_init_settings, etc.).
 
 Threading model: one reader thread, one ping thread, writes serialized with a lock.
-Each callback is invoked on the reader thread; UI layers should post into an
-EventBus and drain it from the Tk main loop.
+Callbacks normally run on the reader thread. A disconnect callback may run on
+the reader or on the caller whose write discovered the failed link; UI layers
+must marshal it through the EventBus.
 """
 from __future__ import annotations
 
@@ -30,6 +31,14 @@ SORT_TIMEOUT_S = 20.0
 
 
 Callback = Callable[[str], None]
+
+
+def _matches_token(line: str, token: str) -> bool:
+    """Match a protocol token at the start of a response line."""
+    if not line.startswith(token):
+        return False
+    rest = line[len(token):]
+    return not rest or not rest[0].isalnum()
 
 
 def list_serial_ports() -> list[str]:
@@ -57,6 +66,8 @@ class SerialBroker:
         self._sp: serial.Serial | None = None
         self._write_lock = threading.Lock()
         self._port_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._link_lost = False
         self._last_activity = time.monotonic()
 
         self._reader_thread: threading.Thread | None = None
@@ -73,6 +84,7 @@ class SerialBroker:
         self.on_response: list[Callback] = []
         self.on_received: list[Callback] = []  # every line, raw
         self.on_sent: list[Callback] = []      # every outbound command (with newline stripped)
+        self.on_disconnect: list[Callback] = []
 
     # ----- lifecycle ----------------------------------------------------------
 
@@ -111,18 +123,25 @@ class SerialBroker:
             banner += self._sp.read_all().decode("ascii", errors="ignore")
         except Exception:
             pass
+        for line in banner.splitlines():
+            line = line.strip("\r\n\t ")
+            if line:
+                self._fire(self.on_received, line)
 
         try:
             self._sp.write(b"version\n")
+            self._fire(self.on_sent, "version")
             version_line = self._sp.readline().decode("ascii", errors="ignore").strip()
         except Exception:
             version_line = ""
+        if version_line:
+            self._fire(self.on_received, version_line)
 
         self.firmware_version = version_line or "Unknown"
         normalized = version_line.lower()
 
         connected = False
-        if "ok" in normalized or "7." in normalized:
+        if _matches_token(normalized, "ok") or normalized.startswith("7."):
             connected = True
         elif "Ready" in banner or not self.require_serial_ready:
             connected = True
@@ -130,6 +149,7 @@ class SerialBroker:
         if connected:
             self._sp.timeout = READ_TIMEOUT_S
             self.is_connected = True
+            self._link_lost = False
             return True
 
         try:
@@ -154,8 +174,8 @@ class SerialBroker:
         self._ping_thread.start()
 
     def stop(self) -> None:
-        self.is_connected = False
         self._stop_event.set()
+        self.is_connected = False
         with self._port_lock:
             if self._sp is not None:
                 try:
@@ -168,27 +188,43 @@ class SerialBroker:
     def close(self) -> None:
         self.stop()
 
+    def _mark_disconnected(self, reason: str) -> None:
+        """Announce one unexpected connected-to-disconnected transition."""
+        with self._state_lock:
+            was_connected = self.is_connected
+            self.is_connected = False
+            announce = was_connected and not self._stop_event.is_set()
+            if announce:
+                self._link_lost = True
+        if announce:
+            self._fire(self.on_disconnect, reason)
+
     # ----- low-level send/read ------------------------------------------------
 
-    def send_command(self, command: str) -> None:
-        if not command.endswith("\n"):
-            command += "\n"
+    def _write(self, payload: str) -> bool:
+        failure = ""
         with self._write_lock:
             if self._sp is None or not self._sp.is_open:
-                return
+                return False
             try:
-                self._sp.write(command.encode("ascii", errors="ignore"))
+                self._sp.write(payload.encode("ascii", errors="ignore"))
                 self._sp.flush()
-            except (serial.SerialException, OSError):
-                self.is_connected = False
-                return
-            self._last_activity = time.monotonic()
-        stripped = command.rstrip("\n")
-        for cb in list(self.on_sent):
-            try:
-                cb(stripped)
-            except Exception:
-                pass
+            except (serial.SerialException, OSError) as exc:
+                failure = f"write failed on {self.port}: {exc}"
+            else:
+                self._last_activity = time.monotonic()
+        if failure:
+            self._mark_disconnected(failure)
+            return False
+        return True
+
+    def send_command(self, command: str) -> bool:
+        if not command.endswith("\n"):
+            command += "\n"
+        if not self._write(command):
+            return False
+        self._fire(self.on_sent, command.rstrip("\n"))
+        return True
 
     def purge_responses(self) -> None:
         time.sleep(0.2)
@@ -218,13 +254,13 @@ class SerialBroker:
                     continue
                 self._buf += line if line.endswith("\n") else line + "\n"
                 self._process_buffer()
-            except (serial.SerialException, OSError, TypeError, AttributeError):
+            except (serial.SerialException, OSError, TypeError, AttributeError) as exc:
                 # TypeError/AttributeError covers the pyserial race where
                 # stop() closes the port (self.fd -> None) while readline()
                 # is mid-read — os.read(None, ...) raises TypeError instead
                 # of OSError. Treat it as a clean disconnect so the reader
                 # thread doesn't crash on shutdown / reconnect.
-                self.is_connected = False
+                self._mark_disconnected(f"read failed on {self.port}: {exc}")
                 time.sleep(0.3)
 
     def _ping_loop(self) -> None:
@@ -248,16 +284,16 @@ class SerialBroker:
             self._fire(self.on_received, line)
 
             normalized = line.lower()
-            if "done" in normalized:
-                self._fire(self.on_done, line)
-                continue
-            if "ok" in normalized:
-                self._fire(self.on_ok, line)
-                continue
-            if "error" in normalized:
+            if _matches_token(normalized, "error"):
                 self._fire(self.on_error, line)
                 continue
-            if "waiting" in normalized:
+            if _matches_token(normalized, "done"):
+                self._fire(self.on_done, line)
+                continue
+            if _matches_token(normalized, "ok"):
+                self._fire(self.on_ok, line)
+                continue
+            if _matches_token(normalized, "waiting"):
                 self._fire(self.on_waiting, line)
                 continue
             self._fire(self.on_response, line)
@@ -277,32 +313,49 @@ class SerialBroker:
 
     def _await_topic(self, topic_handlers: list[Callback], timeout_s: float) -> bool:
         done = threading.Event()
+        hit = False
 
         def _hit(_payload: str) -> None:
+            nonlocal hit
+            hit = True
+            done.set()
+
+        def _abandon(_reason: str) -> None:
             done.set()
 
         topic_handlers.append(_hit)
+        self.on_disconnect.append(_abandon)
         try:
-            return done.wait(timeout=timeout_s)
+            if self._link_lost:
+                return False
+            done.wait(timeout=timeout_s)
+            return hit
         finally:
-            try:
-                topic_handlers.remove(_hit)
-            except ValueError:
-                pass
+            for handlers, handler in (
+                (topic_handlers, _hit),
+                (self.on_disconnect, _abandon),
+            ):
+                try:
+                    handlers.remove(handler)
+                except ValueError:
+                    pass
 
     def feed_one(self) -> bool:
         """xf:0 — feed a single case. Returns True on done."""
-        self.send_command("xf:0")
+        if not self.send_command("xf:0"):
+            return False
         return self._await_topic(self.on_done, FEED_TIMEOUT_S)
 
     def force_sort_and_move(self, slot: int) -> bool:
         """xf:<slot> — force feed to a specific slot."""
-        self.send_command(f"xf:{int(slot)}")
+        if not self.send_command(f"xf:{int(slot)}"):
+            return False
         return self._await_topic(self.on_done, FORCE_FEED_TIMEOUT_S)
 
     def sort_and_move(self, slot: int) -> bool:
         """<slot> — sort the just-fed case to the given slot."""
-        self.send_command(str(int(slot)))
+        if not self.send_command(str(int(slot))):
+            return False
         return self._await_topic(self.on_done, SORT_TIMEOUT_S)
 
     def move_sorter_to_slot(self, slot: int) -> None:
@@ -329,22 +382,41 @@ class SerialBroker:
             except json.JSONDecodeError:
                 pass
 
+        def _abandon(_reason: str) -> None:
+            done.set()
+
         self.on_response.append(_capture)
+        self.on_disconnect.append(_abandon)
         try:
             self.purge_responses()
-            self.send_command("getconfig")
+            if not self.send_command("getconfig"):
+                return None
             done.wait(timeout=timeout_s)
         finally:
-            try:
-                self.on_response.remove(_capture)
-            except ValueError:
-                pass
+            for handlers, handler in (
+                (self.on_response, _capture),
+                (self.on_disconnect, _abandon),
+            ):
+                try:
+                    handlers.remove(handler)
+                except ValueError:
+                    pass
         return result
 
     def update_init_settings(self, settings: dict[str, Any]) -> None:
         """Push each key:value pair to the board."""
-        for key, value in settings.items():
+        from .machine_settings import settings_for_board
+        for key, value in settings_for_board(settings).items():
             if isinstance(value, bool):
                 value = 1 if value else 0
-            self.send_command(f"{key}:{value}")
+            if not self.send_command(f"{key}:{value}"):
+                return
             time.sleep(0.03)
+
+
+def create_broker(port, **kwargs):
+    """Select only the transport; callers keep the same broker contract."""
+    if str(port).strip().lower().startswith(('http://', 'https://')):
+        from .transports.network import NetworkBroker
+        return NetworkBroker(port=port, **kwargs)
+    return SerialBroker(port=port, **kwargs)

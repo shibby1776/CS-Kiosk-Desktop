@@ -36,14 +36,18 @@ device confirmation) are intentionally retained.
 from __future__ import annotations
 
 import concurrent.futures
+import importlib.metadata
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from .torch_security import UnsafeTorchVersionError, require_safe_torch
 
 
 _lock = threading.Lock()
@@ -64,7 +68,8 @@ _device_cache: Any = None
 # algorithm (measured ~825 ms forward vs. ~5 ms when reusing a thread).
 # Routing classify through this executor pins all forward passes to one
 # thread that stays warm for the life of the process.
-_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_coordinator: "_PriorityInferenceCoordinator | None" = None
+_coordinator_lock = threading.Lock()
 
 # Per-step timings populated by the most recent classify() call.
 # Diagnostic only — read directly when investigating perf regressions.
@@ -83,6 +88,108 @@ class LocalInferenceError(Exception):
     pass
 
 
+class InferenceBusyError(LocalInferenceError):
+    """Raised when the bounded remote inference queue is already full."""
+
+
+def installed_version() -> str | None:
+    """Return the installed Torch distribution version without importing it."""
+    try:
+        return importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def checkpoint_env(ckpt: Any) -> dict[str, str]:
+    """Return primitive version metadata from a loaded checkpoint payload."""
+    if not isinstance(ckpt, dict):
+        return {}
+    return {
+        key: value
+        for key in ("torch_version", "torchvision_version", "numpy_version")
+        if isinstance((value := ckpt.get(key)), str) and value
+    }
+
+
+@dataclass
+class _InferenceJob:
+    fn: Any
+    args: tuple[Any, ...]
+    future: concurrent.futures.Future
+
+
+class _PriorityInferenceCoordinator:
+    """One event-driven inference worker with local-sorter priority.
+
+    Local work and remote API work share the same loaded model cache and CUDA
+    context without introducing parallel model execution.  The remote queue is
+    bounded at submission time; local sorter work is never rejected because a
+    remote client filled that queue.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._local: deque[_InferenceJob] = deque()
+        self._remote: deque[_InferenceJob] = deque()
+        self._stopping = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="inference-coordinator",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        fn: Any,
+        *args: Any,
+        priority: str,
+        remote_queue_limit: int,
+    ) -> concurrent.futures.Future:
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        job = _InferenceJob(fn=fn, args=tuple(args), future=future)
+        with self._condition:
+            if self._stopping:
+                future.set_exception(LocalInferenceError("Inference is shutting down."))
+                return future
+            if priority == "remote":
+                if len(self._remote) >= max(1, int(remote_queue_limit)):
+                    future.set_exception(
+                        InferenceBusyError("Remote inference queue is full.")
+                    )
+                    return future
+                self._remote.append(job)
+            else:
+                self._local.append(job)
+            self._condition.notify()
+        return future
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._stopping and not self._local and not self._remote:
+                    self._condition.wait()
+                if self._stopping and not self._local and not self._remote:
+                    return
+                job = self._local.popleft() if self._local else self._remote.popleft()
+            if not job.future.set_running_or_notify_cancel():
+                continue
+            try:
+                job.future.set_result(job.fn(*job.args))
+            except BaseException as exc:
+                job.future.set_exception(exc)
+
+    def shutdown(self) -> None:
+        with self._condition:
+            self._stopping = True
+            while self._remote:
+                job = self._remote.popleft()
+                job.future.set_exception(LocalInferenceError("Inference is shutting down."))
+            self._condition.notify_all()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=3.0)
+
+
 def _torch():
     """Lazy importer. Raises LocalInferenceError with a friendly message if missing."""
     global _torch_mod, _models_mod, _F_mod, _env_dumped
@@ -98,6 +205,10 @@ def _torch():
                 "The installation may be incomplete, a required DLL may be missing, "
                 "or security software may have quarantined a bundled file."
             ) from exc
+        try:
+            require_safe_torch(torch)
+        except UnsafeTorchVersionError as exc:
+            raise LocalInferenceError(str(exc)) from exc
         _torch_mod = torch
         _models_mod = models
         _F_mod = F
@@ -183,7 +294,7 @@ def _dump_environment(torch_mod: Any) -> None:
                 if not supported:
                     print(
                         f"[env] FIX: install a PyTorch build that bakes {sm_tag} "
-                        "in its arch list (e.g. the nightly cu128 build).",
+                        "in its architecture list.",
                         file=sys.stderr, flush=True,
                     )
             # Synthetic benchmarks decouple raw GPU / cuDNN throughput
@@ -335,6 +446,14 @@ def _load(model_path: str) -> _LoadedModel:
         # fails closed (refuses to load) rather than running code; allowlist the
         # specific safe type with torch.serialization.add_safe_globals(...) only
         # if a real file needs it.
+        # This guard intentionally sits immediately beside torch.load. The
+        # import-time check improves the user message, while this boundary
+        # prevents a future refactor from reaching deserialization through an
+        # already-cached unsafe module.
+        try:
+            require_safe_torch(torch)
+        except UnsafeTorchVersionError as exc:
+            raise LocalInferenceError(str(exc)) from exc
         ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
         classes = list(ckpt.get("classes") or [])
         base = ckpt.get("base") or "convnext_tiny"
@@ -383,19 +502,18 @@ def _load(model_path: str) -> _LoadedModel:
         return loaded
 
 
-def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
-    """Lazily create the dedicated single-threaded inference executor.
+def _get_coordinator() -> _PriorityInferenceCoordinator:
+    """Lazily create the dedicated priority inference coordinator.
 
     All classify() work — load, preprocess, forward, postprocess — runs
     on this one thread so cuDNN's per-thread state stays warm across
     consecutive calls.
     """
-    global _executor
-    if _executor is None:
-        _executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="local-inference"
-        )
-    return _executor
+    global _coordinator
+    with _coordinator_lock:
+        if _coordinator is None:
+            _coordinator = _PriorityInferenceCoordinator()
+        return _coordinator
 
 
 def classify(
@@ -403,6 +521,8 @@ def classify(
     model_path: str,
     *,
     image_size: int | None = None,
+    priority: str = "local",
+    remote_queue_limit: int = 4,
 ) -> tuple[str, float]:
     """Run a single image through the local model.
 
@@ -414,14 +534,94 @@ def classify(
     default to 480, our trainer defaults to 232). When None we fall back to
     whatever `_load()` picked from the checkpoint.
 
-    Routed through `_get_executor()` so every call lands on the same
+    Routed through `_get_coordinator()` so every call lands on the same
     thread, keeping cuDNN's per-thread algorithm cache warm. The caller
     blocks on the future; on a CPU-only build this is functionally
     identical to running the work inline.
     """
-    return _get_executor().submit(
-        _classify_impl, image_bgr, model_path, image_size,
+    return _get_coordinator().submit(
+        _classify_impl,
+        image_bgr,
+        model_path,
+        image_size,
+        priority=priority,
+        remote_queue_limit=remote_queue_limit,
     ).result()
+
+
+def classes_for_model(
+    model_path: str,
+    *,
+    priority: str = "remote",
+    remote_queue_limit: int = 4,
+) -> list[str]:
+    """Return the checkpoint's exact ordered classes, loading it if needed."""
+    return _get_coordinator().submit(
+        lambda path: list(_load(path).classes),
+        model_path,
+        priority=priority,
+        remote_queue_limit=remote_queue_limit,
+    ).result()
+
+
+def warm_model(
+    model_path: str,
+    *,
+    image_size: int | None = None,
+    priority: str = "remote",
+    remote_queue_limit: int = 4,
+) -> dict[str, Any]:
+    """Load and exercise a model once before the API server reports ready."""
+
+    def _warm(path: str, configured_size: int | None) -> dict[str, Any]:
+        loaded = _load(path)
+        size = int(configured_size or loaded.image_size or 224)
+        sample = np.zeros((size, size, 3), dtype=np.uint8)
+        _classify_impl(sample, path, size)
+        return {
+            "classes": len(loaded.classes),
+            "base": loaded.base,
+            "image_size": size,
+        }
+
+    return _get_coordinator().submit(
+        _warm,
+        model_path,
+        image_size,
+        priority=priority,
+        remote_queue_limit=remote_queue_limit,
+    ).result()
+
+
+def evict_model(model_path: str) -> None:
+    """Release cached entries for one checkpoint without touching other models."""
+    wanted = str(Path(model_path).resolve())
+    removed = False
+    with _lock:
+        for key in list(_cache):
+            if key[0] == wanted:
+                del _cache[key]
+                removed = True
+    if removed and _torch_mod is not None and _device_cache is not None:
+        try:
+            if _device_cache.type == "cuda":
+                _torch_mod.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def cached_model_paths() -> set[str]:
+    with _lock:
+        return {key[0] for key in _cache}
+
+
+def shutdown() -> None:
+    global _coordinator
+    with _coordinator_lock:
+        coordinator = _coordinator
+        _coordinator = None
+    if coordinator is not None:
+        coordinator.shutdown()
 
 
 def _classify_impl(

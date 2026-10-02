@@ -12,7 +12,7 @@ from sorter.model_io import (
     record_installed_version,
 )
 from sorter.models import Model
-from sorter.repository import HeadstampRepo, ModelRepo, SettingsRepo
+from sorter.repository import ApiModelAliasRepo, HeadstampRepo, ModelRepo, SettingsRepo
 
 
 def _community_archive(
@@ -23,6 +23,7 @@ def _community_archive(
     name: str = "Community 9mm",
     headstamps: tuple[str, ...] = ("FC", "WIN"),
     checkpoint: bytes | None = b"CHECKPOINT-V1",
+    checkpoint_name: str = "trainedmodel.zip",
 ) -> Path:
     manifest = {
         "CartridgeName": "9mm",
@@ -41,7 +42,7 @@ def _community_archive(
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("manifest.json", json.dumps(manifest))
         if checkpoint is not None:
-            archive.writestr("model/trainedmodel.zip", checkpoint)
+            archive.writestr(f"model/{checkpoint_name}", checkpoint)
     return path
 
 
@@ -75,6 +76,7 @@ class CommunityModelUpdateTests(unittest.TestCase):
         _, model_id = self.import_archive(first)
 
         self.settings.set_active_model_id(model_id)
+        ApiModelAliasRepo(self.db).assign("9mm", model_id, preload=True)
         fc = next(
             item for item in self.headstamps.list_for_model(model_id)
             if item.name == "FC"
@@ -96,6 +98,9 @@ class CommunityModelUpdateTests(unittest.TestCase):
         _, updated_id = self.import_archive(second)
 
         self.assertEqual(model_id, updated_id)
+        api_assignment = ApiModelAliasRepo(self.db).get("9MM")
+        self.assertEqual(model_id, api_assignment.model_id)
+        self.assertTrue(api_assignment.preload)
         self.assertEqual(model_id, self.settings.get_active_model_id())
         self.assertEqual(1, len([
             model for model in self.models.list()
@@ -137,6 +142,49 @@ class CommunityModelUpdateTests(unittest.TestCase):
 
         self.assertEqual(b"CHECKPOINT-V1", checkpoint.read_bytes())
         self.assertEqual(str(checkpoint), self.models.get(model_id).model_path)
+
+    def test_community_download_accepts_publisher_checkpoint_filename(self) -> None:
+        archive = _community_archive(
+            self.root / "community-download.zip",
+            checkpoint_name="training_models_24.zip",
+        )
+
+        _, model_id = self.import_archive(
+            archive,
+            community_download=True,
+        )
+
+        checkpoint = self.checkpoints / f"{model_id}.pth"
+        self.assertEqual(b"CHECKPOINT-V1", checkpoint.read_bytes())
+        self.assertEqual("CommunityManaged", self.models.get(model_id).model_type)
+
+    def test_manual_import_still_rejects_arbitrary_checkpoint_zip(self) -> None:
+        archive = _community_archive(
+            self.root / "manual-import.zip",
+            checkpoint_name="publisher-output.zip",
+        )
+
+        with self.assertRaisesRegex(ValueError, "unexpected model entry"):
+            self.import_archive(archive)
+
+    def test_plain_reimport_cannot_downgrade_community_ownership(self) -> None:
+        archive = _community_archive(self.root / "community.zip")
+        _, model_id = self.import_archive(
+            archive,
+            community_download=True,
+        )
+
+        self.import_archive(archive)
+
+        self.assertEqual("CommunityManaged", self.models.get(model_id).model_type)
+
+    def test_import_rejects_multiple_checkpoint_entries(self) -> None:
+        archive = _community_archive(self.root / "multiple.zip")
+        with zipfile.ZipFile(archive, "a") as package:
+            package.writestr("model/second.pth", b"SECOND")
+
+        with self.assertRaisesRegex(ValueError, "multiple model entries"):
+            self.import_archive(archive, community_download=True)
 
     def test_import_can_force_a_separate_copy(self) -> None:
         archive = _community_archive(self.root / "model.zip")

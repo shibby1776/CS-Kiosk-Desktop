@@ -39,10 +39,10 @@ from typing import Any
 from .. import image_proc, local_inference, paths
 from ..config import Config
 from ..events import EventBus
-from ..models import Model
+from ..models import CheckpointEnv, Model
 from ..repository import HeadstampRepo, ModelRepo, SettingsRepo
 from ..training.dataset import class_counts, save_training_image
-from ..training.manager import TrainingJob, TrainingManager
+from ..training.manager import TrainingJob
 from .dialog_install_torch import TorchInstallDialog
 from .dialog_training_config import TrainingConfigDialog
 from .dialog_training_progress import TrainingProgressDialog
@@ -97,7 +97,7 @@ class TrainTab(ttk.Frame):
         self.models_repo = ModelRepo(self.db)
         self.headstamps_repo = HeadstampRepo(self.db)
         self.settings = SettingsRepo(self.db)
-        self.training_manager = TrainingManager(bus)
+        self.training_manager = app.get_training_manager()
         self.training_dialog: TrainingProgressDialog | None = None
         self._last_cropped = None
         self._pending_output: tuple[int, str] | None = None
@@ -486,6 +486,15 @@ class TrainTab(ttk.Frame):
         TrainingConfigDialog(self, m.training_config, on_saved=_on_saved)
 
     def _start_training(self) -> None:
+        server_runtime = getattr(self.app, "api_server_runtime", None)
+        if server_runtime is not None and server_runtime.is_running:
+            messagebox.showwarning(
+                "Stop the API server first",
+                "Stop the integrated API server before training. Training rewrites the "
+                "shared model checkpoint and competes for the same inference device.",
+                parent=self,
+            )
+            return
         m = self._active_model()
         if m is None:
             messagebox.showinfo("Pick a model first",
@@ -501,9 +510,8 @@ class TrainTab(ttk.Frame):
                                    "Save at least one training image first.", parent=self)
             return
 
-        # Torch isn't shipped in the base venv (~2 GB; AI-Config-only users
-        # don't need it). Prompt for the install once on first Train click,
-        # then re-enter this method when it finishes.
+        # Official full installers include Torch. If the runtime is missing or
+        # damaged, offer the existing repair flow and re-enter after it finishes.
         available, torch_detail = local_inference.availability_status()
         if not available:
             TorchInstallDialog(self, on_success=self._start_training, on_cancel=None)
@@ -549,5 +557,6 @@ class TrainTab(ttk.Frame):
             if m is not None and Path(path).exists():
                 m.model_path = path
                 m.last_training_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+                m.checkpoint_env = CheckpointEnv.from_dict(payload.get("env"))
                 self.models_repo.update(m)
                 self._refresh_active_model()

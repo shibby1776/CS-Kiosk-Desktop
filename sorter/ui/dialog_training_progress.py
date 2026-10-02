@@ -137,7 +137,9 @@ class TrainingProgressDialog(tk.Toplevel):
         self._terminal("Done", payload)
 
     def _on_failed(self, payload: dict[str, Any]) -> None:
-        self._terminal(f"Failed (rc={payload.get('return_code')})", payload)
+        message = str(payload.get("message") or "").strip()
+        label = message or f"Failed (rc={payload.get('return_code')})"
+        self._terminal(label, payload)
 
     def _on_cancelled(self, payload: dict[str, Any]) -> None:
         self._terminal("Cancelled.", payload)

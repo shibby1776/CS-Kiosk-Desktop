@@ -1,34 +1,36 @@
 from pathlib import Path
 import unittest
 
+from generate_release_files import load_release_info
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class PublicVersionPrivacyTests(unittest.TestCase):
-    def test_generated_public_version_contains_only_kiosk_version(self) -> None:
+    def test_generated_version_contains_only_public_identity(self) -> None:
         version_source = (ROOT / "sorter" / "version.py").read_text(
             encoding="utf-8"
         )
+        release = load_release_info()
 
-        self.assertIn('PUBLIC_VERSION = "Kiosk 2.2"', version_source)
-        self.assertIn('DESKTOP_RELEASE_VERSION = "1.27.15"', version_source)
-        self.assertIn('INTERNAL_VERSION = "v30"', version_source)
-        self.assertIn('RELEASE_CHANNEL = "public"', version_source)
+        self.assertEqual(
+            version_source,
+            '"""Generated public release metadata. Edit RELEASE.env and run '
+            'generate_release_files.py."""\n'
+            'PUBLIC_VERSION = "Kiosk 2.3"\n'
+            'PUBLIC_VERSION_NUMBER = "2.3"\n'
+            f'APP_VERSION = "{release["APP_VERSION"]}"\n'
+            'RELEASE_DATE = "2026-10-02"\n',
+        )
 
-    def test_diagnostic_export_retains_complete_build_identity(self) -> None:
-        source = (ROOT / "sorter" / "ui" / "tab_diagnostics.py").read_text(
+    def test_diagnostic_export_uses_public_application_identity(self) -> None:
+        source = (ROOT / "sorter" / "ui" / "app.py").read_text(
             encoding="utf-8"
         )
 
-        for field in (
-            '"public_version": PUBLIC_VERSION',
-            '"desktop_release_version": DESKTOP_RELEASE_VERSION',
-            '"internal_version": INTERNAL_VERSION',
-            '"release_channel": RELEASE_CHANNEL',
-            '"release_label": RELEASE_LABEL',
-        ):
-            self.assertIn(field, source)
+        self.assertIn('"public_version": PUBLIC_VERSION', source)
+        self.assertIn('"app_version": APP_VERSION', source)
 
 
 if __name__ == "__main__":

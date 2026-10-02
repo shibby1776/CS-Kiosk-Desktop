@@ -7,7 +7,7 @@ import numpy as np
 
 # These tests exercise selection logic without requiring the large OpenCV
 # package in the source-validation environment.
-sys.modules.setdefault("cv2", SimpleNamespace())
+import cv2  # Required production dependency; never globally shadow it.
 from sorter.camera import Camera
 
 

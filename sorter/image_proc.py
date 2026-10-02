@@ -30,6 +30,9 @@ class HoughParams:
     param2: float = 50.0
     min_radius: int = 90
     max_radius: int = 220
+    reference_width: int = 0
+    expected_x: float | None = None
+    expected_y: float | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "HoughParams":
@@ -40,6 +43,8 @@ class HoughParams:
             param2=float(d.get("param2", 50.0)),
             min_radius=int(d.get("min_radius", 90)),
             max_radius=int(d.get("max_radius", 220)),
+            reference_width=int(d.get("_reference_width",0)),
+            expected_x=d.get("_expected_x"),expected_y=d.get("_expected_y"),
         )
 
 
@@ -104,6 +109,9 @@ def hough_detect(
     case, taking the largest detection within [min_radius, max_radius]
     reliably picks the brass rim whenever both are detected.
     """
+    from dataclasses import replace
+    scale=frame_bgr.shape[1]/params.reference_width if params.reference_width else 1
+    params=replace(params,min_dist=max(1,round(params.min_dist*scale)),min_radius=max(1,round(params.min_radius*scale)),max_radius=max(2,round(params.max_radius*scale)))
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (9, 9), 2)
 
@@ -119,7 +127,12 @@ def hough_detect(
     )
     if circles is None or len(circles[0]) == 0:
         return None
-    best = max(circles[0], key=lambda c: c[2])  # c = (x, y, r)
+    candidates=list(circles[0])
+    if params.expected_x is not None and params.expected_y is not None:
+        x,y=params.expected_x*scale,params.expected_y*scale
+        candidates=[c for c in candidates if (c[0]-x)**2+(c[1]-y)**2 <= (params.min_radius/2)**2]
+        if not candidates:return None
+    best = max(candidates, key=lambda c: c[2])  # c = (x, y, r)
     return float(best[0]), float(best[1]), float(best[2])
 
 
@@ -127,6 +140,7 @@ def hough_crop(frame_bgr: np.ndarray, params: HoughParams) -> np.ndarray:
     """cv2.HoughCircles based crop."""
     detection = hough_detect(frame_bgr, params)
     if detection is None:
+        if params.expected_x is not None:raise ValueError('No valid case rim near the saved centre; inspect the image settings.')
         # Fall back to the middle 30% of the image.
         h, w = frame_bgr.shape[:2]
         return _clip_to_circle(frame_bgr, (w // 2, h // 2), int(min(w, h) * 0.30))

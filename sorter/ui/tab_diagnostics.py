@@ -9,13 +9,6 @@ from tkinter import filedialog, messagebox, ttk
 
 from ..brightness import DEFAULT_GAMMA, DEFAULT_RAW_MAX, percent_to_raw, raw_to_percent
 from ..sensor_diagnostics import SensorDiagnosticRunner
-from ..version import (
-    DESKTOP_RELEASE_VERSION,
-    INTERNAL_VERSION,
-    PUBLIC_VERSION,
-    RELEASE_CHANNEL,
-    RELEASE_LABEL,
-)
 from .widgets import ImagePanel
 
 
@@ -103,6 +96,9 @@ class DiagnosticsTab(ttk.Frame):
         initial_pct = raw_to_percent(initial_raw)
         self.vars["test_percent"].set(f"{initial_pct:.1f}%")
         self.vars["test_raw"].set(str(initial_raw))
+        # ttk.Scale.set() invokes the command callback immediately on some
+        # Tk builds.  Construct the callback's target before setting the scale.
+        self.raw_var = tk.IntVar(value=initial_raw)
 
         ttk.Label(controls, text="Precision brightness").pack(anchor=tk.W)
         self.percent_scale = ttk.Scale(controls, from_=0, to=100, orient=tk.HORIZONTAL, length=400, command=self._on_percent_changed)
@@ -129,7 +125,6 @@ class DiagnosticsTab(ttk.Frame):
 
         advanced = ttk.LabelFrame(controls, text="Advanced Raw Override")
         advanced.pack(fill=tk.X, pady=(8, 0))
-        self.raw_var = tk.IntVar(value=initial_raw)
         self.raw_spin = ttk.Spinbox(advanced, from_=0, to=255, increment=1, textvariable=self.raw_var, width=7)
         self.raw_spin.pack(side=tk.LEFT, padx=8, pady=8)
         ttk.Button(advanced, text="−1", width=4, command=lambda: self._nudge_raw(-1)).pack(side=tk.LEFT, padx=2)
@@ -574,24 +569,16 @@ class DiagnosticsTab(ttk.Frame):
         try:
             exported = self.app.diagnostics.export_zip(
                 path,
-                camera_info=self.app.camera.diagnostic_info(),
-                app_info={
-                    "build": (
-                        f"{PUBLIC_VERSION}; Desktop v{DESKTOP_RELEASE_VERSION}; "
-                        f"{RELEASE_LABEL}; channel={RELEASE_CHANNEL}"
-                    ),
-                    "public_version": PUBLIC_VERSION,
-                    "desktop_release_version": DESKTOP_RELEASE_VERSION,
-                    "internal_version": INTERNAL_VERSION,
-                    "release_channel": RELEASE_CHANNEL,
-                    "release_label": RELEASE_LABEL,
-                    "config_camera": dict(self.config.camera),
-                    "brightness_mapping": {
-                        "mode": "direct_raw_0_255",
-                        "startup_restore": True,
-                    },
-                },
+                camera_info=self.app._camera_diagnostic_info(),
+                app_info=self.app._diagnostic_app_info(),
+                extra_members=(
+                    self.app.crash_reporter.export_members()
+                    if self.app.crash_reporter is not None
+                    else None
+                ),
             )
+            if self.app.crash_reporter is not None:
+                self.app.crash_reporter.clear_pending()
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc), parent=self); return
         messagebox.showinfo("Diagnostic report exported", f"Saved to:\n{exported}", parent=self)

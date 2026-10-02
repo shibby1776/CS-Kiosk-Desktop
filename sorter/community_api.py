@@ -71,6 +71,22 @@ class CartridgeInfo:
         return cls(id=int(d.get("Id", d.get("id", 0))), name=d.get("Name", d.get("name", "")))
 
 
+_EXPORT_MODE_NAMES = {0: "ModelOnly", 1: "ModelAndImages", 2: "ImagesOnly"}
+
+
+def _export_mode_name(raw: Any) -> str:
+    """Normalize the server's numeric or named ModelExportMode value."""
+    if isinstance(raw, str) and raw.strip():
+        value = raw.strip()
+        try:
+            return _EXPORT_MODE_NAMES[int(value)]
+        except (KeyError, ValueError):
+            return value
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return _EXPORT_MODE_NAMES.get(int(raw), "ModelAndImages")
+    return "ModelAndImages"
+
+
 @dataclass
 class ModelInfo:
     model_uid: str
@@ -104,7 +120,7 @@ class ModelInfo:
             image_count=int(get("ImageCount", 0) or 0),
             headstamp_count=int(get("HeadstampCount", 0) or 0),
             download_size=int(get("DownloadSize", 0) or 0),
-            export_mode=get("ModelExportMode", "ModelAndImages"),
+            export_mode=_export_mode_name(get("ModelExportMode", None)),
             feedback_loop_enabled=bool(get("FeedbackLoopEnabled", False)),
             feedback_loop_confidence_floor=int(get("FeedbackLoopConfidenceFloor", 0) or 0),
         )
@@ -155,6 +171,76 @@ class FeedbackUploadTicket:
     def blob_put_url(self) -> str:
         """Full SAS URL to PUT the blob to: ``{ContainerURI}/{BlobPath}?{SasToken}``."""
         return f"{self.container_uri}/{self.blob_path}?{self.sas_token}"
+
+
+@dataclass
+class ModeratorNote:
+    id: int
+    note: str
+    created: str = ""
+
+
+@dataclass
+class ModelSettings:
+    """Current server-side feedback settings for a community model."""
+
+    wish_list: list[str] = field(default_factory=list)
+    confidence_floor: int = 0
+    feedback_enabled: bool = True
+    blocked: bool = False
+    version: int = 0
+    notes: list[ModeratorNote] = field(default_factory=list)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "ModelSettings":
+        low = {str(key).lower(): value for key, value in data.items()}
+
+        def as_int(key: str, default: int) -> int:
+            try:
+                value = low.get(key, default)
+                return default if isinstance(value, bool) else int(value)
+            except (TypeError, ValueError):
+                return default
+
+        raw_wish = low.get("wishlist") or []
+        wish_list = (
+            [item.strip() for item in raw_wish if isinstance(item, str) and item.strip()]
+            if isinstance(raw_wish, list)
+            else []
+        )
+        notes: list[ModeratorNote] = []
+        raw_notes = low.get("notes") or []
+        if isinstance(raw_notes, list):
+            for entry in raw_notes:
+                note = _moderator_note_from_json(entry)
+                if note is not None:
+                    notes.append(note)
+        return cls(
+            wish_list=wish_list,
+            confidence_floor=as_int("confidencefloor", 0),
+            feedback_enabled=bool(low.get("feedbackenabled", True)),
+            blocked=bool(low.get("blocked", False)),
+            version=as_int("version", 0),
+            notes=notes,
+        )
+
+
+def _moderator_note_from_json(entry: Any) -> ModeratorNote | None:
+    if not isinstance(entry, dict):
+        return None
+    low = {str(key).lower(): value for key, value in entry.items()}
+    text = low.get("note")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        note_id = int(low.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return ModeratorNote(
+        id=note_id,
+        note=text.strip(),
+        created=str(low.get("created") or ""),
+    )
 
 
 @dataclass
@@ -389,6 +475,66 @@ class CommunityApi:
         ticket = FeedbackUploadTicket.from_json(data)
         debug_log(f"  ticket: accepted={ticket.feedback_accepted} container={ticket.container_uri!r} blob={ticket.blob_path!r}")
         return ticket
+
+    def fetch_wish_list(self, community_model_uid: str) -> list[str]:
+        """Fetch classifications requested by the model owner.
+
+        This retains the source application's fail-open behavior: any network,
+        authentication, response-status or JSON problem returns an empty list.
+        """
+        if not community_model_uid:
+            return []
+        try:
+            response = self._get(
+                "/Models/FetchWishList?communityModelId="
+                + quote_plus(community_model_uid)
+            )
+        except Exception as exc:
+            debug_log(f"GET /Models/FetchWishList failed ({type(exc).__name__}: {exc})")
+            return []
+        if response.status_code != 200:
+            return []
+        try:
+            data = response.json()
+        except ValueError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [
+            item.strip()
+            for item in data
+            if isinstance(item, str) and item.strip()
+        ]
+
+    def fetch_model_settings(
+        self, community_model_uid: str
+    ) -> ModelSettings | None:
+        """Fetch the current feedback policy and wish list for one model."""
+        if not community_model_uid:
+            return None
+        try:
+            response = self._get(
+                "/Models/FetchModelSettings?communityModelId="
+                + quote_plus(community_model_uid)
+            )
+        except Exception as exc:
+            debug_log(
+                f"GET /Models/FetchModelSettings failed "
+                f"({type(exc).__name__}: {exc})"
+            )
+            return None
+        debug_log(
+            f"GET /Models/FetchModelSettings -> HTTP {response.status_code}"
+        )
+        if response.status_code != 200:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return ModelSettings.from_json(data)
 
     def upload_feedback_blob(
         self,

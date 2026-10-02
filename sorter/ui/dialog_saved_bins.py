@@ -18,6 +18,7 @@ from ..saved_bins import (
     FILE_SUFFIX,
     copy_layout_file,
 )
+from ..windows_usb import removable_usb_roots
 from .dialog_saved_bins_editor import SavedBinsEditor
 
 
@@ -574,30 +575,7 @@ class SavedBinsDialog(tk.Toplevel):
     @staticmethod
     def _removable_usb_roots() -> list[Path]:
         """Return Windows removable-drive roots, checked only on demand."""
-        if os.name != "nt":
-            return []
-        roots: list[Path] = []
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            kernel32.GetLogicalDrives.restype = ctypes.c_uint32
-            kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
-            kernel32.GetDriveTypeW.restype = ctypes.c_uint
-            drive_mask = int(kernel32.GetLogicalDrives())
-            for index in range(26):
-                if not drive_mask & (1 << index):
-                    continue
-                root = f"{chr(ord('A') + index)}:\\"
-                path = Path(root)
-                if (
-                    int(kernel32.GetDriveTypeW(root)) == 2
-                    and path.is_dir()
-                ):
-                    roots.append(path)
-        except (AttributeError, OSError, TypeError, ValueError):
-            return []
-        return roots
+        return removable_usb_roots()
 
     def _choose_usb_root(self) -> Path | None:
         roots = self._removable_usb_roots()

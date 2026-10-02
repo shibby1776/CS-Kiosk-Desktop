@@ -1,4 +1,4 @@
-"""Generate deterministic release metadata from RELEASE.env."""
+"""Generate deterministic public release metadata from RELEASE.env."""
 
 from __future__ import annotations
 
@@ -9,15 +9,8 @@ import re
 
 
 ROOT = Path(__file__).resolve().parent
-REQUIRED_KEYS = {
-    "KIOSK_VERSION",
-    "DESKTOP_VERSION",
-    "RELEASE_DATE",
-    "INTERNAL_VERSION",
-    "RELEASE_CHANNEL",
-}
+REQUIRED_KEYS = {"KIOSK_VERSION", "APP_VERSION", "RELEASE_DATE"}
 VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)+$")
-INTERNAL_RE = re.compile(r"^v[0-9]+$")
 
 
 def load_release_info() -> dict[str, str]:
@@ -43,14 +36,9 @@ def load_release_info() -> dict[str, str]:
         raise ValueError(f"RELEASE.env is missing: {', '.join(sorted(missing))}")
     if extra:
         raise ValueError(f"RELEASE.env has unknown keys: {', '.join(sorted(extra))}")
-    if not VERSION_RE.fullmatch(info["KIOSK_VERSION"]):
-        raise ValueError("KIOSK_VERSION must contain only dotted numbers")
-    if not VERSION_RE.fullmatch(info["DESKTOP_VERSION"]):
-        raise ValueError("DESKTOP_VERSION must contain only dotted numbers")
-    if not INTERNAL_RE.fullmatch(info["INTERNAL_VERSION"]):
-        raise ValueError("INTERNAL_VERSION must be formatted like v17")
-    if not re.fullmatch(r"[a-z]+", info["RELEASE_CHANNEL"]):
-        raise ValueError("RELEASE_CHANNEL must contain lowercase letters only")
+    for key in ("KIOSK_VERSION", "APP_VERSION"):
+        if not VERSION_RE.fullmatch(info[key]):
+            raise ValueError(f"{key} must contain only dotted numbers")
 
     parsed_date = date.fromisoformat(info["RELEASE_DATE"])
     info["RELEASE_DATE_LONG"] = (
@@ -69,48 +57,24 @@ def render_notice(info: dict[str, str]) -> str:
 
 def render_version_module(info: dict[str, str]) -> str:
     kiosk = info["KIOSK_VERSION"]
-    internal = info["INTERNAL_VERSION"]
-    channel = info["RELEASE_CHANNEL"]
-    channel_title = {
-        "verification": "Format Verification",
-        "savedbins": "Saved Bins Test",
-        "savedbinsremote": "Saved Bins Remote Test",
-        "savedbinsmulti": "Saved Bins Multi-Select Test",
-        "savedbinscontrols": "Saved Bins Controls Test",
-        "slotconfiglabel": "Slot Config Label Test",
-        "maintenancepreview": "Maintenance Preview Layout Test",
-        "sensordiagnostics": "Sensor Diagnostics Test",
-        "reintigration": "Reintigration Test",
-        "binsfilename": "Saved Bins Filename Policy Test",
-        "slotsync": "Slot Assignment Sync Test",
-        "installerupgrade": "Windows Installer Upgrade Test",
-        "binscompatibility": "Saved Bins Compatibility Test",
-        "usbtransfer": "Saved Bins USB Transfer Test",
-        "usbimportfix": "Saved Bins USB Import Fix Test",
-        "public": "Public",
-    }.get(channel, channel.title())
-    public_version = f"Kiosk {kiosk}"
     return (
-        '"""Generated release metadata. Do not edit directly; '
-        'edit RELEASE.env and run generate_release_files.py."""\n'
-        f'PUBLIC_VERSION = "{public_version}"\n'
+        '"""Generated public release metadata. Edit RELEASE.env and run '
+        'generate_release_files.py."""\n'
+        f'PUBLIC_VERSION = "Kiosk {kiosk}"\n'
         f'PUBLIC_VERSION_NUMBER = "{kiosk}"\n'
-        f'DESKTOP_RELEASE_VERSION = "{info["DESKTOP_VERSION"]}"\n'
+        f'APP_VERSION = "{info["APP_VERSION"]}"\n'
         f'RELEASE_DATE = "{info["RELEASE_DATE"]}"\n'
-        f'INTERNAL_VERSION = "{internal}"\n'
-        f'RELEASE_CHANNEL = "{channel}"\n'
-        f'RELEASE_LABEL = "{internal} {channel_title}"\n'
-        f'IMAGE_BASENAME = "ai-case-sorter-kiosk-v{kiosk}-{internal}-{channel}"\n'
-        f'ARCHIVE_BASENAME = "AI-Case-Sorter-Kiosk-v{kiosk}-Internal-'
-        f'{internal}-{channel_title.replace(" ", "-")}-Ubuntu-pi-gen"\n'
     )
 
 
 def render_installer_version(info: dict[str, str]) -> str:
+    kiosk = info["KIOSK_VERSION"]
     return (
-        "; Generated release metadata. Do not edit directly.\n"
-        f'#define MyAppVersion "{info["DESKTOP_VERSION"]}"\n'
-        f'#define MyPublicVersion "{info["KIOSK_VERSION"]}"\n'
+        "; Generated public release metadata. Do not edit directly.\n"
+        f'#define MyAppVersion "{info["APP_VERSION"]}"\n'
+        f'#define MyPublicVersion "{kiosk}"\n'
+        f'#define MyDisplayVersion "Kiosk {kiosk}"\n'
+        '#define MyInstallerSuffix "Public"\n'
     )
 
 
@@ -119,18 +83,10 @@ def validate_project_version(info: dict[str, str]) -> None:
     match = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', pyproject)
     if not match:
         raise ValueError("pyproject.toml does not contain a project version")
-    def normalized(value: str) -> tuple[int, ...]:
-        parts = [int(part) for part in value.split(".")]
-        while len(parts) > 1 and parts[-1] == 0:
-            parts.pop()
-        return tuple(parts)
-
-    project_version = normalized(match.group(1))
-    desktop_version = normalized(info["DESKTOP_VERSION"])
-    if project_version != desktop_version:
+    if match.group(1) != info["APP_VERSION"]:
         raise ValueError(
-            "pyproject.toml version does not match DESKTOP_VERSION: "
-            f"{match.group(1)} != {info['DESKTOP_VERSION']}"
+            "pyproject.toml version does not match APP_VERSION: "
+            f"{match.group(1)} != {info['APP_VERSION']}"
         )
 
 

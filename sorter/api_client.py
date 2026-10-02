@@ -3,16 +3,23 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from typing import Any
 
-import cv2
 import numpy as np
-import requests
 
 
-# Module-level session — pools TCP/TLS connections per host so repeated
-# classify calls don't pay handshake cost (typically 100-500 ms each on HTTPS).
-_session = requests.Session()
+# Created only when remote inference is actually used. This preserves pooled
+# connections without importing the HTTP stack for local-only operation.
+_session: Any = None
+
+
+def _get_session():
+    global _session
+    if _session is None:
+        import requests
+        _session = requests.Session()
+    return _session
 
 
 class ApiError(Exception):
@@ -21,6 +28,7 @@ class ApiError(Exception):
 
 def _encode_jpeg(image_bgr: np.ndarray, scale_pct: int, quality: int) -> bytes:
     """JPEG-encode a BGR frame."""
+    import cv2
     if scale_pct != 100:
         scale = max(1, scale_pct) / 100.0
         w = max(1, int(image_bgr.shape[1] * scale))
@@ -96,7 +104,16 @@ def classify(
         "Authorization": f"Bearer {api_key}",
     }
 
-    resp = _session.post(url, headers=headers, data=json.dumps(body), timeout=timeout)
+    encoded_body = json.dumps(body)
+    session = _get_session()
+    resp = session.post(url, headers=headers, data=encoded_body, timeout=timeout)
+    if resp.status_code == 429:
+        try:
+            delay = min(1.0, max(0.0, float(resp.headers.get("Retry-After", "0.25"))))
+        except (TypeError, ValueError):
+            delay = 0.25
+        time.sleep(delay)
+        resp = session.post(url, headers=headers, data=encoded_body, timeout=timeout)
     if resp.status_code >= 400:
         raise ApiError(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
@@ -122,6 +139,18 @@ def classify(
     return label, confidence
 
 
+def ensure_ready(cfg):
+    try:
+        labels = get_headstamps(cfg.get('endpoint_url', ''), cfg.get('model', ''), cfg.get('api_key', ''), timeout=30.0)
+    except ApiError as exc:
+        raise ApiError('Inference model not ready: ' + str(exc)) from exc
+    except Exception as exc:
+        raise ApiError('Inference server stopped, unreachable, or model unavailable. Start the server and verify AI Config before sorting.') from exc
+    if not labels:
+        raise ApiError('The selected inference model has no classifications.')
+    return labels
+
+
 def get_headstamps(
     endpoint: str,
     model: str,
@@ -137,7 +166,7 @@ def get_headstamps(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
         headers["X-API-Key"] = api_key
-    resp = _session.get(
+    resp = _get_session().get(
         url, params={"model": model}, headers=headers, timeout=timeout
     )
     if resp.status_code >= 400:
@@ -172,4 +201,40 @@ def get_headstamps(
         if name and name.casefold() not in seen:
             names.append(name)
             seen.add(name.casefold())
+    return names
+
+
+def list_models(
+    endpoint: str,
+    api_key: str = "",
+    *,
+    timeout: float = 15.0,
+) -> list[str]:
+    """Discover server-advertised model ids through ``GET /v1/models``."""
+    if not endpoint:
+        raise ApiError("Endpoint is required.")
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["X-API-Key"] = api_key
+    resp = _get_session().get(
+        endpoint.rstrip("/") + "/v1/models",
+        headers=headers,
+        timeout=timeout,
+    )
+    if resp.status_code >= 400:
+        raise ApiError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    payload = resp.json()
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(data, list):
+        raise ApiError("Server did not return a model list.")
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in data:
+        value = item.get("id") if isinstance(item, dict) else item
+        name = str(value or "").strip()
+        key = name.casefold()
+        if name and key not in seen:
+            names.append(name)
+            seen.add(key)
     return names

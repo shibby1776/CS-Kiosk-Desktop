@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import traceback
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,7 @@ from .training.dataset import parse_feedback_filename, save_feedback_image
 # Floor on the publisher's floor: even if a publisher set a very low
 # threshold, anything under 50% confidence is worth moderating.
 MIN_EFFECTIVE_FLOOR = 50
+MAX_WISH_LIST_CAPTURES_PER_LABEL = 40
 
 
 def _debug_enabled() -> bool:
@@ -68,13 +71,120 @@ def is_feedback_model(model: Model | None) -> bool:
 class FeedbackService:
     def __init__(self, db: Any) -> None:
         self.db = db
+        self._wish_lock = threading.Lock()
+        self._wish_model_id: int | None = None
+        self._wish_list: set[str] = set()
+        self._wish_counts: dict[str, int] = {}
+        self._server_lock = threading.Lock()
+        self._server_model_id: int | None = None
+        self._server_floor = 0
+        self._server_capture_allowed = True
+
+    # ----- server policy and wish list ---------------------------------------
+
+    def set_wish_list(self, model_id: int | None, names: Iterable[str]) -> None:
+        cleaned = {name.strip().lower() for name in (names or ()) if name and name.strip()}
+        with self._wish_lock:
+            self._wish_model_id = model_id if cleaned else None
+            self._wish_list = cleaned
+            self._wish_counts = {}
+        debug_log(f"wish list for model {model_id}: {sorted(cleaned) or '(empty)'}")
+
+    def clear_wish_list(self) -> None:
+        self.set_wish_list(None, ())
+
+    def wish_list(self) -> list[str]:
+        with self._wish_lock:
+            return sorted(self._wish_list)
+
+    def _claim_wish_capture(self, model: Model | None, label: str) -> bool:
+        key = (label or "").strip().lower()
+        if model is None or not key:
+            return False
+        with self._wish_lock:
+            if model.id != self._wish_model_id or key not in self._wish_list:
+                return False
+            used = self._wish_counts.get(key, 0)
+            if used >= MAX_WISH_LIST_CAPTURES_PER_LABEL:
+                return False
+            self._wish_counts[key] = used + 1
+        return True
+
+    def apply_server_settings(
+        self,
+        model_id: int | None,
+        *,
+        confidence_floor: int = 0,
+        feedback_enabled: bool = True,
+        blocked: bool = False,
+    ) -> None:
+        with self._server_lock:
+            self._server_model_id = model_id
+            self._server_floor = max(0, int(confidence_floor))
+            self._server_capture_allowed = bool(feedback_enabled) and not bool(blocked)
+        debug_log(
+            f"server settings for model {model_id}: floor={confidence_floor} "
+            f"enabled={feedback_enabled} blocked={blocked}"
+        )
+
+    def clear_server_settings(self) -> None:
+        self.apply_server_settings(None)
+
+    def _server_policy(self, model: Model) -> tuple[int, bool]:
+        with self._server_lock:
+            if model.id != self._server_model_id:
+                return 0, True
+            return self._server_floor, self._server_capture_allowed
+
+    def refresh_server_settings(self, model: Model | None, *, auth: Any) -> Any:
+        """Fetch and apply the source application's current feedback contract.
+
+        Failures clear transient server policy and wish-list state, returning
+        to the installed model's local confidence rule without blocking a run.
+        """
+        if not is_feedback_model(model) or auth is None:
+            self.clear_server_settings()
+            self.clear_wish_list()
+            return None
+        try:
+            from .community_api import CommunityApi
+
+            settings = CommunityApi(auth=auth).fetch_model_settings(
+                str(model.community_model_uid)
+            )
+        except Exception:
+            debug_log("model settings fetch FAILED:\n" + traceback.format_exc())
+            settings = None
+        if settings is None:
+            self.clear_server_settings()
+            self.clear_wish_list()
+            return None
+        self.apply_server_settings(
+            model.id,
+            confidence_floor=settings.confidence_floor,
+            feedback_enabled=settings.feedback_enabled,
+            blocked=settings.blocked,
+        )
+        self.set_wish_list(model.id, settings.wish_list)
+        return settings
 
     # ----- policy -------------------------------------------------------------
 
     def effective_floor(self, model: Model) -> int:
-        return max(MIN_EFFECTIVE_FLOOR, int(model.feedback_loop_confidence_floor))
+        floor, _allowed = self._server_policy(model)
+        return max(
+            MIN_EFFECTIVE_FLOOR,
+            int(floor or model.feedback_loop_confidence_floor),
+        )
 
-    def should_capture(self, model: Model | None, confidence: float) -> bool:
+    def should_capture(
+        self,
+        model: Model | None,
+        confidence: float,
+        label: str = "",
+        *,
+        wish_list: bool = False,
+    ) -> bool:
         """Capture below-floor predictions on feedback-enabled community models.
 
         Confidence is a 0-100 percentage; ``-1`` (unknown — e.g. an HTTP
@@ -87,16 +197,24 @@ class FeedbackService:
                 f"community_uid={getattr(model, 'community_model_uid', None)!r})"
             )
             return False
-        if confidence is None or confidence < 0:
-            debug_log(f"should_capture=False: unknown confidence ({confidence!r})")
+        if not self._server_policy(model)[1]:
+            debug_log("should_capture=False: server disabled or blocked feedback")
             return False
         floor = self.effective_floor(model)
-        decision = float(confidence) < floor
+        if confidence is not None and confidence >= 0 and float(confidence) < floor:
+            debug_log(
+                f"should_capture=True: confidence={confidence} vs effective_floor={floor} "
+                f"(publisher_floor={model.feedback_loop_confidence_floor}, mode={model.feedback_loop_upload_mode})"
+            )
+            return True
+        if wish_list and self._claim_wish_capture(model, label):
+            debug_log(f"should_capture=True: {label!r} is on the model wish list")
+            return True
         debug_log(
-            f"should_capture={decision}: confidence={confidence} vs effective_floor={floor} "
-            f"(publisher_floor={model.feedback_loop_confidence_floor}, mode={model.feedback_loop_upload_mode})"
+            f"should_capture=False: confidence={confidence} vs effective_floor={floor}; "
+            f"label={label!r}; wish_list_checked={wish_list}"
         )
-        return decision
+        return False
 
     # ----- staging folder (the queue) ----------------------------------------
 

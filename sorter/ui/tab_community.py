@@ -73,20 +73,27 @@ class CommunityModelCard(ttk.Frame):
         self.installed_state = installed_state
         self.on_action = on_action
 
+        self._info_cells = []
+        self._wrapped_labels = []
         # Header: model name
-        ttk.Label(
+        title = ttk.Label(
             self, text=info.model_name, style="CardTitle.TLabel",
-        ).pack(side=tk.TOP, anchor="w")
+        )
+        title.pack(side=tk.TOP, anchor="w",fill=tk.X)
+        self._wrapped_labels.append(title)
 
         # Info grid (3 columns × 3 rows)
         grid = ttk.Frame(self, style="Card.TFrame")
+        self._info_grid = grid
         grid.pack(side=tk.TOP, fill=tk.X, pady=(8, 6))
 
         def _cell(row: int, col: int, label: str, value: str) -> None:
             f = ttk.Frame(grid, style="Card.TFrame")
             f.grid(row=row, column=col, sticky="w", padx=(0, 32), pady=2)
             ttk.Label(f, text=f"{label}:", style="CardSubtle.TLabel").pack(side=tk.LEFT)
-            ttk.Label(f, text=value, style="CardMuted.TLabel").pack(side=tk.LEFT, padx=(6, 0))
+            value_label=ttk.Label(f,text=value,style="CardMuted.TLabel",justify=tk.LEFT)
+            value_label.pack(side=tk.LEFT,padx=(6,0),fill=tk.X,expand=True)
+            self._info_cells.append((f,value_label))
 
         _cell(0, 0, "Cartridge", info.cartridge_name or "—")
         _cell(0, 1, "File Size", _format_size(info.download_size))
@@ -99,10 +106,12 @@ class CommunityModelCard(ttk.Frame):
 
         # Description
         if info.model_description:
-            ttk.Label(
+            description=ttk.Label(
                 self, text=info.model_description,
                 style="CardSubtle.TLabel", wraplength=900, justify=tk.LEFT,
-            ).pack(side=tk.TOP, anchor="w", pady=(2, 8), fill=tk.X)
+            )
+            description.pack(side=tk.TOP,anchor="w",pady=(2,8),fill=tk.X)
+            self._wrapped_labels.append(description)
 
         # Action button (right-aligned)
         action_row = ttk.Frame(self, style="Card.TFrame")
@@ -120,6 +129,16 @@ class CommunityModelCard(ttk.Frame):
                              style="Accent.TButton",
                              command=lambda: self.on_action(self.info))
         btn.pack(side=tk.RIGHT)
+        self.bind("<Configure>",self._layout_card)
+
+    def _layout_card(self,event):
+        width=max(120,event.width-28)
+        columns=3 if width>=900 else 2 if width>=580 else 1
+        for col in range(3): self._info_grid.columnconfigure(col,weight=1 if col<columns else 0,uniform='info' if col<columns else '')
+        for index,(cell,label) in enumerate(self._info_cells):
+            cell.grid(row=index//columns,column=index%columns,sticky='nsew',padx=(0,12),pady=2)
+            label.configure(wraplength=max(70,width//columns-150))
+        for label in self._wrapped_labels: label.configure(wraplength=width)
 
 
 class CommunityTab(ttk.Frame):
@@ -138,6 +157,13 @@ class CommunityTab(ttk.Frame):
         self.db = app.db
         self._models: list[ModelInfo] = []
         self._cartridges: list[CartridgeInfo] = []
+        # Only one archive may update the model tree at a time. Additional
+        # operator requests wait in this bounded-by-user-action FIFO rather
+        # than racing database rows and checkpoint files.
+        self._download_queue: list[tuple[ModelInfo, str, bool, bool]] = []
+        self._active_download_uid: str | None = None
+        self._batch_total = 0
+        self._batch_done = 0
 
         self._build_toolbar()
         self._build_filter_bar()
@@ -291,7 +317,8 @@ class CommunityTab(ttk.Frame):
         # otherwise we'd render a redundant inner scrollbar alongside the
         # tab's outer one.
         self._list_body = ttk.Frame(self)
-        self._list_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self._list_body.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._list_body.bind("<Configure>", lambda _e: self._refresh_scroll())
 
     # ----- data flow ----------------------------------------------------------
 
@@ -312,6 +339,15 @@ class CommunityTab(ttk.Frame):
             self.status_var.set(f"Could not load cartridges: {exc}")
 
         self.app.run_worker(_work, on_done=_ok, on_error=_fail)
+
+    def _refresh_scroll(self):
+        widget = self.master
+        while widget is not None:
+            refresh = getattr(widget, 'refresh_scroll_region', None)
+            if refresh is not None:
+                self.after_idle(refresh)
+                break
+            widget = getattr(widget, 'master', None)
 
     def _refresh(self) -> None:
         cart = "" if self.cart_var.get() == "All" else self.cart_var.get()
@@ -338,6 +374,7 @@ class CommunityTab(ttk.Frame):
                     on_action=self._download,
                 )
                 card.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+            self._refresh_scroll()
 
         def _fail(exc: Exception):
             self.status_var.set(f"Failed: {exc}")
@@ -358,33 +395,80 @@ class CommunityTab(ttk.Frame):
 
     def _download(self, info: ModelInfo) -> None:
         name = info.model_name or info.model_uid or "model"
-        is_update = self._installed_state(info) == "update"
+        state = self._installed_state(info)
+        if state == "installed":
+            return
         controller = getattr(self.app, "run_controller", None)
-        if is_update and controller is not None and controller.is_running:
+        if controller is not None and controller.is_running:
             messagebox.showwarning(
                 "Stop sorting first",
-                "Stop the active sorting run before updating its installed model.",
+                "Stop the active sorting run before installing or updating a model.",
                 parent=self,
             )
             return
-        if not messagebox.askyesno(
-            "Download model — security notice",
-            f"\"{name}\" is a community-published model. Models are loaded with "
-            "PyTorch and can execute code embedded in the file, so only download "
-            "models from authors you trust.\n\n"
-            + (
-                "Download and install this update?"
-                if is_update
-                else "Download and import this model?"
-            ),
-            icon="warning",
-            default="no",
-            parent=self,
+        if state == "update":
+            choice = messagebox.askyesnocancel(
+                "Update installed model?",
+                f'"{name}" is already installed and a newer version is available.\n\n'
+                "Choose Yes to update the installed model in place and preserve its "
+                "slot assignments and local settings. Choose No to install a separate "
+                "copy, or Cancel to do nothing.",
+                icon="warning",
+                parent=self,
+            )
+            if choice is None:
+                return
+            update_existing = bool(choice)
+        else:
+            if not messagebox.askyesno(
+                "Download model — security notice",
+                f'"{name}" is a community-published model. Only download models '
+                "from authors you trust.\n\nDownload and import this model?",
+                icon="warning",
+                default="no",
+                parent=self,
+            ):
+                return
+            update_existing = True
+
+        is_update = state == "update" and update_existing
+        self._enqueue_download(info, name, update_existing, is_update)
+
+    def _enqueue_download(
+        self,
+        info: ModelInfo,
+        name: str,
+        update_existing: bool,
+        is_update: bool,
+    ) -> None:
+        if self._active_download_uid == info.model_uid or any(
+            queued[0].model_uid == info.model_uid
+            for queued in self._download_queue
         ):
             return
-        self._post_progress(f"Downloading {name}…")
+        self._batch_total += 1
+        if self._active_download_uid is not None:
+            self._download_queue.append(
+                (info, name, update_existing, is_update)
+            )
+            self._post_progress(
+                f"Queued {name} ({len(self._download_queue)} waiting)."
+            )
+            return
+        self._start_download(info, name, update_existing, is_update)
 
-        def _work():
+    def _start_download(
+        self,
+        info: ModelInfo,
+        name: str,
+        update_existing: bool,
+        is_update: bool,
+    ) -> None:
+        self._batch_done += 1
+        self._active_download_uid = info.model_uid
+        self._post_progress(f"{self._batch_prefix()}Downloading {name}…")
+
+        def _work() -> tuple[int, int]:
             api = self._api()
             payload = api.request_download(info.model_uid)
             url = payload.get("FullUrl") or payload.get("fullUrl")
@@ -392,10 +476,6 @@ class CommunityTab(ttk.Frame):
                 raise RuntimeError("Server did not return a download URL")
             with tempfile.TemporaryDirectory() as tmpdir:
                 zip_path = Path(tmpdir) / f"{info.model_uid}.zip"
-
-                # Throttle download progress to whole-percent changes so we
-                # don't flood the bus (download_to fires the callback per
-                # 64 KB chunk — ~16 calls per MB).
                 last_pct: list[int] = [-1]
 
                 def _dl_progress(done: int, total: int | None) -> None:
@@ -403,28 +483,29 @@ class CommunityTab(ttk.Frame):
                         pct = int(done * 100 / total)
                         if pct != last_pct[0]:
                             last_pct[0] = pct
-                            mb_done = done / (1024 * 1024)
-                            mb_total = total / (1024 * 1024)
                             self._post_progress(
-                                f"Downloading {name}: {pct}% ({mb_done:.1f} / {mb_total:.1f} MB)"
+                                f"{self._batch_prefix()}Downloading {name}: {pct}% "
+                                f"({done / (1024 * 1024):.1f} / "
+                                f"{total / (1024 * 1024):.1f} MB)"
                             )
                     else:
-                        mb_done = done / (1024 * 1024)
-                        # No Content-Length: report bytes-done every ~1 MB.
-                        if int(mb_done) != last_pct[0]:
-                            last_pct[0] = int(mb_done)
+                        megabytes = done / (1024 * 1024)
+                        if int(megabytes) != last_pct[0]:
+                            last_pct[0] = int(megabytes)
                             self._post_progress(
-                                f"Downloading {name}: {mb_done:.1f} MB"
+                                f"{self._batch_prefix()}Downloading {name}: "
+                                f"{megabytes:.1f} MB"
                             )
 
                 api.download_to(
-                    url, zip_path,
+                    url,
+                    zip_path,
                     expected_total=info.download_size or None,
                     progress=_dl_progress,
                 )
-
-                self._post_progress(f"Importing {name}…")
-
+                self._post_progress(
+                    f"{self._batch_prefix()}Importing {name}…"
+                )
                 last_import_pct: list[int] = [-1]
 
                 def _import_progress(step: int, total: int) -> None:
@@ -434,32 +515,56 @@ class CommunityTab(ttk.Frame):
                     if pct != last_import_pct[0]:
                         last_import_pct[0] = pct
                         self._post_progress(
-                            f"Importing {name}: {pct}% ({step} / {total} files)"
+                            f"{self._batch_prefix()}Importing {name}: {pct}% "
+                            f"({step} / {total} files)"
                         )
 
                 result = import_model(
-                    zip_path, db=self.db, progress=_import_progress,
+                    zip_path,
+                    db=self.db,
+                    community_download=True,
+                    update_existing=update_existing,
+                    progress=_import_progress,
                 )
-                record_installed_version(self.db, result[1], info.model_version)
+                record_installed_version(
+                    self.db,
+                    result[1],
+                    info.model_version,
+                )
                 return result
 
-        def _ok(result):
-            _cart_id, mid = result
+        def _ok(result: tuple[int, int]) -> None:
+            self._finish_download()
+            _cart_id, model_id = result
             self._post_progress(
                 f"Updated {name} to v{info.model_version}."
                 if is_update else f"Imported {name}."
             )
-            self._notify_import(mid, updated=is_update)
+            self._notify_import(model_id, updated=is_update)
             models_tab = getattr(self.app, "models_tab", None)
             if models_tab is not None:
                 models_tab.refresh()
             self._refresh()
 
-        def _fail(exc: Exception):
+        def _fail(exc: Exception) -> None:
             self._post_progress(f"Download failed: {exc}")
             messagebox.showerror("Download failed", str(exc), parent=self)
+            self._finish_download()
 
         self.app.run_worker(_work, on_done=_ok, on_error=_fail)
+
+    def _batch_prefix(self) -> str:
+        if self._batch_total <= 1:
+            return ""
+        return f"({self._batch_done} of {self._batch_total}) "
+
+    def _finish_download(self) -> None:
+        self._active_download_uid = None
+        if self._download_queue:
+            self._start_download(*self._download_queue.pop(0))
+            return
+        self._batch_total = 0
+        self._batch_done = 0
 
     def _notify_import(self, model_id: int, *, updated: bool = False) -> None:
         """Post-import dialog. Community models with the feedback loop enabled

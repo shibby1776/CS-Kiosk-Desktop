@@ -10,7 +10,7 @@ from sorter.version import PUBLIC_VERSION
 
 from PIL import Image, ImageTk
 
-from ..events import post_assignment_changed
+from ..events import plan_assignment_refresh, post_assignment_changed
 from .tab_run import FlowGrid, SlotCard, SlotDetailsPanel
 from .theme import PALETTE
 from .widgets import ImagePanel
@@ -41,6 +41,7 @@ class KioskDashboard(ttk.Frame):
         self._logo_source = None
         self._logo_photo = None
         self._logo_render_size: tuple[int, int] | None = None
+        self._assignments_dirty = False
 
         self.columnconfigure(0, weight=5)
         self.columnconfigure(1, weight=6)
@@ -167,11 +168,16 @@ class KioskDashboard(ttk.Frame):
         bus.subscribe("run/cropped", self.processing_image.show_bgr)
         bus.subscribe("run/classified", self._on_classified)
         bus.subscribe("run/result", self._on_result)
-        bus.subscribe("run/assignment_changed", lambda _p: self._on_assignment_changed())
+        bus.subscribe("run/assignment_changed", self._on_assignment_changed)
         bus.subscribe("run/headstamps_synced", self._on_labels)
         bus.subscribe("run/headstamps_sync_warning", self._on_label_warning)
         bus.subscribe("run/counters_reset", lambda _p: self._clear_counters())
-        bus.subscribe("mode/changed", lambda _p: self._on_assignment_changed())
+        bus.subscribe(
+            "mode/changed",
+            lambda _p: self._on_assignment_changed(
+                {"source": "mode_changed", "full_refresh": True}
+            ),
+        )
 
     def _load_logo(self) -> None:
         """Load the approved transparent logo and trim only transparent padding."""
@@ -203,8 +209,9 @@ class KioskDashboard(ttk.Frame):
             card = SlotCard(self.slot_grid, slot_number=slot_num, on_click=self._select_slot)
             self.slot_grid.add(card)
             self._slot_cards.append(card)
+        self.slot_grid.finish()
 
-    def _refresh_card_headstamps(self) -> None:
+    def _refresh_card_headstamps(self, slots: set[int] | None = None) -> None:
         slot_map: dict[int, list[str]] = defaultdict(list)
         if self.config.run_package_mode:
             for slot, names in self.config.package_slot_map().items():
@@ -229,6 +236,8 @@ class KioskDashboard(ttk.Frame):
                 if name and slot > 0:
                     slot_map[slot].append(name)
         for card in self._slot_cards:
+            if slots is not None and card.slot_number not in slots:
+                continue
             card.set_headstamps(sorted(slot_map.get(card.slot_number, []), key=str.casefold))
             card.set_count(self._slot_counts[card.slot_number])
 
@@ -237,19 +246,40 @@ class KioskDashboard(ttk.Frame):
             card.set_selected(card.slot_number == slot_num)
         self.details.show_slot(slot_num)
 
-    def _on_assignment_changed(self) -> None:
-        self._refresh_card_headstamps()
-        if self.details.current_slot is not None:
+    def _on_assignment_changed(
+        self, payload: dict | None = None, *, force: bool = False
+    ) -> None:
+        action, slots = plan_assignment_refresh(
+            payload,
+            visible=not self.app._maintenance_mode,
+            local_source="operator_manual",
+            force=force,
+        )
+        if action == "defer":
+            self._assignments_dirty = True
+            return
+        if action == "skip":
+            return  # the click handler already updated this visible surface
+
+        self._assignments_dirty = False
+        self._refresh_card_headstamps(slots)
+        if action == "full" and self.details.current_slot is not None:
             self.details.show_slot(self.details.current_slot)
 
-    def _notify_assignment_changed(self) -> None:
+    def _notify_assignment_changed(self, change: dict | None = None) -> None:
         """Publish a manual Operator assignment through the shared event bus."""
-        post_assignment_changed(self.app.bus, "operator_manual")
+        changed_slot = (change or {}).get("slot")
+        slots = {changed_slot} if isinstance(changed_slot, int) else None
+        self._refresh_card_headstamps(slots)
+        post_assignment_changed(self.app.bus, "operator_manual", change)
 
     def refresh_saved_bins_runtime(self) -> None:
         """Synchronously redraw routing after a verified Saved Bins load."""
         self._clear_counters()
-        self._on_assignment_changed()
+        if self.app._maintenance_mode:
+            self._assignments_dirty = True
+        else:
+            self._on_assignment_changed(force=True)
 
     def sync_auto_select_from_config(self) -> None:
         """Refresh the operator toggle from the persisted shared setting."""

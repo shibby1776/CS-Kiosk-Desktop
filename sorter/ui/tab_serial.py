@@ -6,7 +6,7 @@ wire-protocol key the firmware expects.
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 from .. import serial_broker
 from ..serial_emulator import EMULATED_PORT
@@ -54,8 +54,11 @@ class SerialTab(ttk.Frame):
         connect = ttk.LabelFrame(self, text="Connection")
         connect.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
 
-        ttk.Label(connect, text="Port").grid(row=0, column=0, padx=6, pady=4, sticky=tk.W)
-        self.port_var = tk.StringVar(value=ser_cfg.get("port", ""))
+        ttk.Label(connect, text="USB port").grid(row=0, column=0, padx=6, pady=4, sticky=tk.W)
+        existing = str(ser_cfg.get('port', ''))
+        self.wifi_var = tk.BooleanVar(value=bool(ser_cfg.get('wifi_enabled', existing.startswith(('http://','https://')))))
+        self.wifi_address_var = tk.StringVar(value=ser_cfg.get('wifi_address', existing if self.wifi_var.get() else ''))
+        self.port_var = tk.StringVar(value=ser_cfg.get('usb_port', '' if self.wifi_var.get() else existing))
         self.port_combo = ttk.Combobox(connect, textvariable=self.port_var, width=24)
         self.port_combo.grid(row=0, column=1, padx=6, pady=4, sticky=tk.W)
         ttk.Button(connect, text="Refresh ports", command=self.refresh_ports).grid(row=0, column=2, padx=6)
@@ -91,7 +94,22 @@ class SerialTab(ttk.Frame):
             ("Get config from board", self.fetch_board_config),
             ("Push to board", self.push_to_board),
             ("Save", self.save),
+            ("Import previous setup", self.import_setup),
         ], primary="Connect").grid(row=2, column=0, columnspan=7, padx=4, pady=4, sticky=tk.W)
+
+        ttk.Checkbutton(connect, text='Kiosk Node (network sorter)', variable=self.wifi_var,
+                        command=self._wifi_changed).grid(row=3,column=0,columnspan=2,padx=6,pady=4,sticky=tk.W)
+        self.wifi_entry = ttk.Entry(connect,textvariable=self.wifi_address_var,width=28)
+        self.wifi_entry.grid(row=3,column=2,columnspan=3,padx=6,sticky=tk.W)
+        self._update_connection_mode()
+        from ..sorter_profiles import SorterProfiles
+        profiles = SorterProfiles(self.config)
+        ttk.Label(connect,text='Saved sorter').grid(row=4,column=0,padx=6,sticky=tk.W)
+        self.profile_var = tk.StringVar(value=profiles.active())
+        self.profile_combo = ttk.Combobox(connect,textvariable=self.profile_var,values=profiles.names(),width=24)
+        self.profile_combo.grid(row=4,column=1,padx=6,pady=4,sticky=tk.W)
+        ttk.Button(connect,text='Save sorter',command=self._save_profile).grid(row=4,column=2,padx=6)
+        ttk.Button(connect,text='Load sorter',command=self._load_profile).grid(row=4,column=3,padx=6)
 
         # ---- Slot count + sort-arm test ------------------------------------
         sorter_box = ttk.LabelFrame(self, text="Sort arm")
@@ -150,6 +168,8 @@ class SerialTab(ttk.Frame):
             field = NumericField(airdrop, label, from_=lo, to=hi, initial=value)
             field.grid(row=0, column=idx + 1, padx=6, pady=4, sticky=tk.W)
             self.init_widgets[key] = field
+        self.airdrop_enabled_var.trace_add('write',lambda *_:self._update_airdrop_fields())
+        self._update_airdrop_fields()
 
         # ---- firmware information (read-only) -------------------------------
         # The board's exact firmware string is obtained during the serial
@@ -207,13 +227,79 @@ class SerialTab(ttk.Frame):
     def connect_with_selected(self) -> None:
         """Save the form first so config matches what's on screen, then connect
         to the port currently shown in the dropdown."""
-        port = (self.port_var.get() or "").strip()
+        try:
+            self.save()
+        except ValueError as exc:
+            messagebox.showerror('Connection',str(exc),parent=self);return
+        port = self.config.serial.get('port','').strip()
         if not port:
             messagebox.showerror("No port selected",
                                  "Pick a port from the dropdown (or click Refresh ports).")
             return
-        self.save()
         self.app.connect_serial(port=port)
+
+    def import_setup(self):
+        from tkinter import filedialog
+        import json
+        from pathlib import Path
+        path=filedialog.askopenfilename(parent=self, title='Import previous sorter settings or report',filetypes=[('JSON settings or report','*.json')])
+        if not path:return
+        if not messagebox.askyesno('Import setup','Replace this application connection, camera crop and remote bin profile with the selected setup? Local models and saved layouts are retained.',parent=self):return
+        try:
+            result=self.app.import_connection_settings(json.loads(Path(path).read_text(encoding='utf-8-sig')))
+            messagebox.showinfo('Imported',result['message'],parent=self)
+        except Exception as exc:messagebox.showerror('Import',str(exc),parent=self)
+
+    def _update_connection_mode(self):
+        remote = self.wifi_var.get()
+        self.port_combo.configure(state='disabled' if remote else 'normal')
+        self.wifi_entry.configure(state='normal' if remote else 'disabled')
+
+    def _update_airdrop_fields(self):
+        state='normal' if self.airdrop_enabled_var.get() else 'disabled'
+        for _label,key,_lo,_hi,_default in AIRDROP_FIELDS:
+            self.init_widgets[key].spin.configure(state=state)
+
+    def _wifi_changed(self):
+        if self.wifi_var.get():
+            value = simpledialog.askstring('Kiosk Node','Enter the Kiosk Node IP address:',
+                                          initialvalue=self.wifi_address_var.get(),parent=self)
+            if value is None:
+                self.wifi_var.set(False)
+            else:
+                try:
+                    from ..connections import wifi_address
+                    self.wifi_address_var.set(wifi_address(value))
+                    self.init_on_startup_var.set(False)
+                except ValueError:
+                    self.wifi_var.set(False)
+                    messagebox.showerror('Invalid IP','Enter the sorter IP, for example 192.168.4.92.',parent=self)
+        self._update_connection_mode()
+
+    def load_connection_form(self):
+        c=self.config.serial;port=str(c.get('port',''))
+        self.wifi_var.set(bool(c.get('wifi_enabled',port.startswith(('http://','https://')))))
+        self.wifi_address_var.set(c.get('wifi_address',port if self.wifi_var.get() else ''))
+        self.port_var.set(c.get('usb_port','' if self.wifi_var.get() else port))
+        self.baud_var.set(c.get('baud',9600));self.probe_timeout_var.set(c.get('handshake_timeout_s',4))
+        self.slot_count_var.set(c.get('slot_quantity',8));self.init_on_startup_var.set(c.get('init_on_startup',False))
+        init=c.get('init_settings',{})
+        for key,field in self.init_widgets.items(): field.set(init.get(key,0))
+        self.sort_steps_var.set(init.get('sortsteps',20));self.airdrop_enabled_var.set(bool(int(init.get('airdropenabled',0))))
+        self._update_connection_mode();self.refresh_ports()
+
+    def _save_profile(self):
+        try:
+            self.app.ensure_connection_idle()
+            self.save()
+            from ..sorter_profiles import SorterProfiles
+            profiles=SorterProfiles(self.config);self.profile_var.set(profiles.save(self.profile_var.get()))
+            self.profile_combo['values']=profiles.names();self.app.set_status('Sorter profile saved.')
+        except Exception as exc: messagebox.showerror('Sorter profile',str(exc),parent=self)
+
+    def _load_profile(self):
+        try: self.app.select_sorter_profile(self.profile_var.get())
+        except Exception as exc: messagebox.showerror('Sorter profile',str(exc),parent=self)
 
     def refresh_ports(self) -> None:
         ports = serial_broker.list_serial_ports() + [EMULATED_PORT]
@@ -222,7 +308,9 @@ class SerialTab(ttk.Frame):
             self.port_var.set(ports[0])
 
     def save(self) -> None:
-        self.config.serial["port"] = self.port_var.get()
+        from ..connections import connection_settings
+        self.config.data['serial'] = connection_settings(self.config.serial,
+            wifi_enabled=self.wifi_var.get(),address=self.wifi_address_var.get(),usb_port=self.port_var.get())
         self.config.serial["baud"] = int(self.baud_var.get())
         self.config.serial["handshake_timeout_s"] = float(self.probe_timeout_var.get())
         self.config.serial["slot_quantity"] = int(self.slot_count_var.get())
@@ -311,6 +399,10 @@ class SerialTab(ttk.Frame):
         if not payload:
             self.app.set_status("Board returned no config.")
             return
+        from ..machine_settings import normalized_board_config
+        payload=normalized_board_config(payload)
+        if 'airdropenabled' in payload:
+            self.airdrop_enabled_var.set(bool(int(payload['airdropenabled'])))
         applied = 0
         for key, value in payload.items():
             if key in self.init_widgets:

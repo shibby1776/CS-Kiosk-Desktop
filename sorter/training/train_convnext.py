@@ -46,6 +46,10 @@ except ImportError as exc:  # pragma: no cover - guarded by Train UI
     )
     raise
 
+from ..torch_security import require_safe_torch
+
+require_safe_torch(torch)
+
 
 SUPPORTED_MODELS = ("convnext_tiny", "convnext_small", "convnext_base", "convnext_large")
 
@@ -57,7 +61,74 @@ def _emit(event: str, **payload: Any) -> None:
     sys.stdout.flush()
 
 
-def parse_args() -> argparse.Namespace:
+def _say(line: str = "") -> None:
+    print(line, flush=True)
+
+
+def checkpoint_env() -> dict[str, str]:
+    """Primitive-only library provenance safe for weights_only checkpoints."""
+    import numpy
+    import torchvision
+
+    return {
+        "torch_version": str(torch.__version__),
+        "torchvision_version": str(torchvision.__version__),
+        "numpy_version": str(numpy.__version__),
+    }
+
+
+def _describe_device(device: Any) -> list[str]:
+    env = checkpoint_env()
+    lines = [
+        "[SETUP] PyTorch "
+        f"{env['torch_version']} (torchvision {env['torchvision_version']}, "
+        f"numpy {env['numpy_version']})",
+        f"[SETUP] CUDA available: {torch.cuda.is_available()}",
+    ]
+    if device.type == "cuda":
+        index = device.index or 0
+        major, minor = torch.cuda.get_device_capability(index)
+        total_gb = torch.cuda.get_device_properties(index).total_memory / (1024 ** 3)
+        lines.extend(
+            [
+                f"[SETUP] CUDA runtime: {torch.version.cuda}, "
+                f"cuDNN {torch.backends.cudnn.version()}",
+                "[INFO] Device: CUDA",
+                f"[INFO] Detected GPU: {torch.cuda.get_device_name(index)} "
+                f"({total_gb:.1f} GB, compute sm_{major}{minor})",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "[INFO] Device: CPU",
+                "[INFO] No CUDA device — training on the CPU is much slower.",
+            ]
+        )
+    return lines
+
+
+def _describe_config(args: argparse.Namespace) -> list[str]:
+    settings = [
+        ("Model", args.model_name),
+        ("Batch Size", args.batch_size),
+        ("Initial LR", args.lr),
+        ("Weight Decay", args.weight_decay),
+        ("Dropout", args.dropout),
+        ("Validation Split", args.val_split),
+        ("Full Dataset Training", bool(args.trainall)),
+        ("Image Size", f"{args.imgsize}x{args.imgsize}"),
+        ("Freeze Backbone", bool(args.freeze_backbone)),
+        ("Focal Loss", f"gamma {args.focal_gamma}" if args.use_focal_loss else False),
+        ("SWA", f"from {args.swa_start:.0%} ({args.swa_mode})" if args.use_swa else False),
+        ("Target Epochs", args.epochs),
+    ]
+    return ["[INFO] Configuration:"] + [
+        f"       {name}: {value}" for name, value in settings
+    ]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ConvNeXt trainer")
     p.add_argument("--image_dir", required=True)
     p.add_argument("--output_model", required=True)
@@ -86,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--swa_patience", type=int, default=5)
     p.add_argument("--swa_min_epoch", type=int, default=10)
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 # ----- Dataset (module-level so DataLoader workers can pickle) --------------
@@ -212,8 +283,8 @@ def _run_epoch(model, loader, criterion, optimizer, scaler, device,
     return running_loss / max(total, 1), correct / max(total, 1)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -224,7 +295,15 @@ def main() -> int:
     model_ctor, model_weights = _get_model_weights(args.model_name)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    for line in _describe_device(device):
+        _say(line)
+    _say()
+    for line in _describe_config(args):
+        _say(line)
+    _say()
+
     dataset = FilenameLabelDataset(args.image_dir)
+    _say(f"[INFO] Loaded {len(dataset)} images across {len(dataset.classes)} classes")
     _emit(
         "start",
         epochs=args.epochs,
@@ -273,6 +352,8 @@ def main() -> int:
     val_loader = None
     if val_sub is not None:
         val_loader = DataLoader(TransformSubset(val_sub, val_tf), shuffle=False, **loader_args)
+    _say(f"[INFO] Data loader workers: {num_workers}")
+    _say(f"[INFO] Split: {n_train} training / {n_val} validation images")
 
     if args.stochastic_depth_prob >= 0:
         model = model_ctor(weights=model_weights, stochastic_depth_prob=args.stochastic_depth_prob)
@@ -367,6 +448,7 @@ def main() -> int:
             # Record the resize target so inference uses the same scale
             # the model was trained at (default 232; user can override).
             "image_size": int(args.imgsize),
+            **checkpoint_env(),
         }
         if val_acc is None:
             torch.save(save_payload, args.output_model)
@@ -403,9 +485,15 @@ def main() -> int:
             "classes": dataset.classes,
             "base": args.model_name,
             "image_size": int(args.imgsize),
+            **checkpoint_env(),
         }, swa_path)
 
-    _emit("done", best_val_acc=best_acc if best_acc >= 0 else None, best_val_loss=best_loss)
+    _emit(
+        "done",
+        best_val_acc=best_acc if best_acc >= 0 else None,
+        best_val_loss=best_loss,
+        env=checkpoint_env(),
+    )
     return 0
 
 

@@ -23,12 +23,14 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
 
 from .. import paths
+from ..api_server_settings import ApiServerSettingsRepo
 from ..config import Config
 from ..db import Database
 from ..events import EventBus
 from ..model_io import ExportMode, export_model, find_update_target, import_model
 from ..models import Headstamp, HeadstampParent, Model
 from ..repository import (
+    ApiModelAliasRepo,
     CartridgeRepo,
     HeadstampParentRepo,
     HeadstampRepo,
@@ -182,11 +184,59 @@ class ModelsTab(ttk.Frame):
         self.models = ModelRepo(self.db)
         self.headstamps = HeadstampRepo(self.db)
         self.settings = SettingsRepo(self.db)
+        self.api_aliases = ApiModelAliasRepo(self.db)
 
+        self._build_software_profile()
         self._build_filter_bar()
         self._build_toolbar()
         self._build_list()
         self.refresh()
+
+    def _build_software_profile(self) -> None:
+        box = ttk.LabelFrame(self, text="Software Profile", padding=8)
+        box.pack(fill=tk.X, padx=8, pady=(8, 4))
+        self.profile_var = tk.StringVar(value=self.config.software_profile)
+        ttk.Radiobutton(
+            box,
+            text="Classification Only — local and remote sorting; training hidden",
+            value="classification_only",
+            variable=self.profile_var,
+            command=self._on_profile_changed,
+        ).pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(
+            box,
+            text="Full — local and remote sorting plus local model training",
+            value="full",
+            variable=self.profile_var,
+            command=self._on_profile_changed,
+        ).pack(anchor=tk.W, pady=2)
+
+    def _on_profile_changed(self) -> None:
+        selected = self.profile_var.get()
+        previous = self.config.software_profile
+        if selected == previous:
+            return
+        train_tab = getattr(self.app, "train_tab", None)
+        manager = getattr(train_tab, "training_manager", None)
+        if manager is not None and manager.is_running:
+            messagebox.showwarning(
+                "Training in progress",
+                "Stop the active training job before changing Software Profile.",
+                parent=self,
+            )
+            self.profile_var.set(previous)
+            return
+        label = "Classification Only" if selected == "classification_only" else "Full"
+        if not messagebox.askyesno(
+            "Change Software Profile",
+            f"Change this installation to {label}?",
+            parent=self,
+        ):
+            self.profile_var.set(previous)
+            return
+        self.config.set_software_profile(selected)
+        self.bus.post("profile/changed", {"profile": selected})
+        self.app._apply_training_visibility()
 
     # ----- UI construction ----------------------------------------------------
 
@@ -224,7 +274,8 @@ class ModelsTab(ttk.Frame):
         ttk.Frame(row).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="New cartridge", command=self._new_cartridge).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(row, text="New model", command=self._new_model).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(row, text="Import…", command=self._import_zip).pack(side=tk.LEFT)
+        ttk.Button(row, text="Import…", command=self._import_zip).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(row, text="API Server…", command=self.app.show_server_tab).pack(side=tk.LEFT)
 
     def _build_list(self) -> None:
         # The whole tab is already hosted in a ScrollableFrame (see
@@ -251,6 +302,9 @@ class ModelsTab(ttk.Frame):
         active_id = self.settings.get_active_model_id()
         cart_by_id = {c.id: c.name for c in carts}
         image_counts = self._image_counts()
+        api_names_by_model: dict[int, list[str]] = {}
+        for assignment in self.api_aliases.list():
+            api_names_by_model.setdefault(assignment.model_id, []).append(assignment.alias)
 
         # Synthetic "Use AI Config" sentinel — only shown when no type filter
         # excludes it (it isn't Standard/Community/ReadOnly so it appears in
@@ -281,6 +335,7 @@ class ModelsTab(ttk.Frame):
                 ("Images", str(image_counts.get(m.id, m.trained_image_count))),
                 ("Last trained", last_trained),
                 ("Trained", "yes" if m.model_path else "no"),
+                ("API name", ", ".join(api_names_by_model.get(m.id, [])) or "—"),
             ]
             is_active = m.id == active_id
             actions: list[tuple[str, Callable[[], None]]] = []
@@ -292,6 +347,7 @@ class ModelsTab(ttk.Frame):
             # Evaluate needs a trained checkpoint to run inference against.
             if m.model_path:
                 actions.append(("Evaluate", lambda mid=m.id: self._evaluate(mid)))
+                actions.append(("Serve", lambda mid=m.id: self._serve(mid)))
             actions.append(("Export", lambda mid=m.id: self._export(mid)))
             actions.append(("Delete", lambda mid=m.id: self._delete(mid)))
             ModelRowCard(
@@ -379,12 +435,32 @@ class ModelsTab(ttk.Frame):
         self.settings.set_active_model_id(model_id)
         self.config.reload_headstamps_for_active_model()
         self.bus.post("mode/changed", {"active_model_id": model_id})
+        self.app._apply_training_visibility()
         self.refresh()
+        model = self.models.get(model_id)
+        configured = ApiServerSettingsRepo(self.db).is_configured()
+        if (
+            configured
+            and model is not None
+            and model.model_path
+            and not self.api_aliases.aliases_for_model(model_id)
+            and messagebox.askyesno(
+                "Make available to API clients?",
+                f'Use "{self.cartridges.get(model.cartridge_id).name}" as the suggested '
+                f'API name for "{model.name}"?\n\nYou can edit the name and preload choice before assigning it.',
+                parent=self,
+            )
+        ):
+            self.app.show_server_tab(model_id)
+
+    def _serve(self, model_id: int) -> None:
+        self.app.show_server_tab(model_id)
 
     def _activate_ai_config(self) -> None:
         self.settings.clear_active_model()
         self.config.reload_headstamps_for_active_model()
         self.bus.post("mode/changed", {"active_model_id": None})
+        self.app._apply_training_visibility()
         self.refresh()
 
     def _new_cartridge(self) -> None:
@@ -425,6 +501,23 @@ class ModelsTab(ttk.Frame):
         m = self.models.get(model_id)
         if m is None:
             return
+        controller = getattr(self.app, "run_controller", None)
+        if controller is not None and controller.is_running:
+            messagebox.showwarning(
+                "Stop sorting first",
+                "Stop the active sorting run before deleting a model.",
+                parent=self,
+            )
+            return
+        train_tab = getattr(self.app, "train_tab", None)
+        manager = getattr(train_tab, "training_manager", None)
+        if manager is not None and manager.is_running:
+            messagebox.showwarning(
+                "Stop training first",
+                "Stop the active training job before deleting a model.",
+                parent=self,
+            )
+            return
         if not messagebox.askyesno(
             "Confirm delete",
             f"Delete model '{m.name}' and all associated headstamps and training images?",
@@ -432,7 +525,7 @@ class ModelsTab(ttk.Frame):
         ):
             return
         try:
-            self.models.delete(model_id)
+            active_cleared = self.models.delete(model_id)
         except ValueError as exc:
             messagebox.showwarning("Cannot delete", str(exc), parent=self)
             return
@@ -440,6 +533,14 @@ class ModelsTab(ttk.Frame):
         per_model = paths.model_dir(model_id)
         if per_model.exists():
             shutil.rmtree(per_model, ignore_errors=True)
+        if m.model_path:
+            from .. import local_inference
+
+            local_inference.evict_model(m.model_path)
+        if active_cleared:
+            self.config.reload_headstamps_for_active_model()
+            self.bus.post("mode/changed", {"active_model_id": None})
+            self.app._apply_training_visibility()
         self.refresh()
 
     def _edit_headstamps(self, model_id: int) -> None:
@@ -477,9 +578,9 @@ class ModelsTab(ttk.Frame):
             return
         if not messagebox.askyesno(
             "Import model — security notice",
-            "A model archive contains a serialized neural network that is loaded "
-            "with PyTorch. Loading a model can execute code embedded in the file, "
-            "so only import models from sources you trust.\n\n"
+            "A model archive contains a serialized neural network. Kiosk loads "
+            "checkpoints in restricted weights-only mode, but you should still "
+            "import models only from sources you trust.\n\n"
             "Import this archive?",
             icon="warning",
             default="no",
@@ -495,6 +596,15 @@ class ModelsTab(ttk.Frame):
             messagebox.showwarning(
                 "Stop sorting first",
                 "Stop the active sorting run before updating its installed model.",
+                parent=self,
+            )
+            return
+        server_runtime = getattr(self.app, "api_server_runtime", None)
+        if server_runtime is not None and server_runtime.is_running:
+            messagebox.showwarning(
+                "Stop the API server first",
+                "Stop the integrated API server before importing or updating models. "
+                "Model imports refresh the shared inference cache.",
                 parent=self,
             )
             return

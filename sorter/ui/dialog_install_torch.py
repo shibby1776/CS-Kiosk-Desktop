@@ -3,12 +3,12 @@
 Training is gated on this so AI-Config-only users never pay the ~2 GB
 torch install cost. On open we detect a supported Nvidia GPU (compute
 capability ≥ 8.0). If one is present, the user gets to pick between
-the GPU build (CUDA 12.8 wheels) and the CPU build; otherwise only
+the GPU build (CUDA 13.0 wheels) and the CPU build; otherwise only
 the CPU build is offered.
 
 `pip install` runs in a subprocess and streams its output to the dialog's
-console. On success the calling tab's `on_success` callback fires and the
-training run proceeds; on cancel/failure the venv is left as-is.
+console. A restart is required after success so an older already-imported
+runtime cannot remain active in memory.
 """
 from __future__ import annotations
 
@@ -23,13 +23,13 @@ from ..gpu_detect import GpuInfo, detect_supported_nvidia_gpu
 from .theme import PALETTE
 
 
-# Pin exactly the versions the legacy project validates against. Floating
-# versions (`torch>=2.2`) let pip pull the
-# latest — which is a moving target and has been observed to regress
-# ConvNeXt inference on the RTX 50-series.
-_TARGETS = ("torch==2.9.1", "torchvision==0.24.1")
+# Pin the security-reviewed pair used by the packaged build. PyTorch releases
+# before 2.10.0 are rejected because their weights-only checkpoint loader does
+# not provide the security boundary this application requires.
+_TARGETS = ("torch==2.13.0", "torchvision==0.28.0")
 _CPU_TARGETS = _TARGETS
-_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
+_CUDA_TARGETS = ("torch==2.13.0+cu130", "torchvision==0.28.0+cu130")
+_CUDA_INDEX = "https://download.pytorch.org/whl/cu130"
 
 
 class TorchInstallDialog(tk.Toplevel):
@@ -165,8 +165,10 @@ class TorchInstallDialog(tk.Toplevel):
         active_btn = self.gpu_btn if (use_gpu and self._gpu is not None) else self.cpu_btn
         active_btn.config(text="Installing…")
 
-        cmd: list[str] = [sys.executable, "-u", "-m", "pip", "install",
-                          *list(_CPU_TARGETS)]
+        targets = _CUDA_TARGETS if use_gpu else _CPU_TARGETS
+        cmd: list[str] = [
+            sys.executable, "-u", "-m", "pip", "install", *list(targets)
+        ]
         if use_gpu:
             cmd.extend(["--index-url", _CUDA_INDEX])
         self._append("$ " + " ".join(cmd) + "\n")
@@ -196,13 +198,11 @@ class TorchInstallDialog(tk.Toplevel):
     def _finish(self, success: bool) -> None:
         self._installing = False
         if success:
-            self._append("\nInstall complete.\n")
+            self._append("\nInstall complete. Restart the application before training.\n")
             for b in self._install_buttons:
                 b.config(state=tk.DISABLED, text="Done")
             self.cancel_btn.config(text="Close")
-            if self._on_success is not None:
-                self._on_success()
-            self.destroy()
+            self.title("PyTorch Installed — Restart Required")
         else:
             self._append("\nInstall failed. See output above.\n")
             for b in self._install_buttons:

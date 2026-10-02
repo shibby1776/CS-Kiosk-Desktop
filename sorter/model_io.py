@@ -39,6 +39,7 @@ from typing import Any, Callable, Iterable
 from . import paths
 from .models import (
     AIModelConfig,
+    CheckpointEnv,
     Headstamp,
     ImageProcessingConfig,
     Model,
@@ -85,6 +86,19 @@ def _normalize(entry_name: str) -> str:
 def _is_traversal(rel: str) -> bool:
     p = PurePosixPath(rel)
     return any(part == ".." for part in p.parts)
+
+
+def _is_zip_checkpoint_name(name: str, *, community_download: bool) -> bool:
+    """Return whether ``name`` is an allowed PyTorch ZIP checkpoint.
+
+    A direct Community download may retain any publisher-generated checkpoint
+    basename.  Manual imports keep the exact legacy exemption so an arbitrary
+    nested ZIP is not accepted merely because it was supplied from disk.
+    """
+    return (
+        name.lower() == _LEGACY_ZIP_MODEL_NAME
+        or (community_download and Path(name).suffix.lower() == ".zip")
+    )
 
 
 def model_to_export_dict(m: Model) -> dict[str, Any]:
@@ -208,6 +222,9 @@ def model_from_export_dict(d: dict[str, Any]) -> Model:
             feedback_enabled=fb_enabled,
         ),
         model_path=None,
+        checkpoint_env=CheckpointEnv.from_dict(
+            _g(d, "checkpoint_env", "CheckpointEnv")
+        ),
     )
 
 
@@ -387,8 +404,15 @@ def _merge_onto_installed(incoming: Model, existing: Model, *, name: str) -> Mod
     incoming.id = existing.id
     incoming.name = name
     incoming.ai_model_config = existing.ai_model_config
+    # Ownership never downgrades on update.  A publisher's archive can carry
+    # ``Standard`` because that is the publisher's own copy; importing the same
+    # bytes from disk must not turn an installed Community model trainable.
+    if existing.model_type in ("ReadOnly", "CommunityManaged"):
+        incoming.model_type = existing.model_type
     # An images-only update must not orphan an existing checkpoint.
     incoming.model_path = existing.model_path
+    if incoming.checkpoint_env.is_empty():
+        incoming.checkpoint_env = existing.checkpoint_env
     # The publisher may offer feedback, but an update must never opt a user
     # back in after they disabled it locally.
     incoming.feedback_loop_enabled = bool(
@@ -408,11 +432,16 @@ def import_model(
     images_target_dir: Path | str | None = None,
     models_target_dir: Path | str | None = None,
     update_existing: bool = True,
+    community_download: bool = False,
     progress: Callable[[int, int], None] | None = None,
 ) -> tuple[int, int]:
     """Import a model archive.
 
     Returns (cartridge_id, model_id).
+
+    Pass ``community_download=True`` only when the archive came directly from
+    the Community service.  Ownership is then stamped ``CommunityManaged``
+    based on its trusted arrival path rather than a manifest claim.
 
     A community archive whose UID is already installed updates that model in
     place by default. Keeping its database id preserves local headstamp and
@@ -432,6 +461,7 @@ def import_model(
         # Pre-scan: reject anything dangerous before we touch the FS —
         # path-traversal entries, decompression bombs, and entries whose
         # extension isn't one we expect to extract.
+        model_entries = 0
         for entry in entries:
             rel = _normalize(entry.filename)
             if _is_traversal(rel):
@@ -458,10 +488,27 @@ def import_model(
                         f"{entry.filename!r}"
                     )
             elif posix.parts and posix.parts[0] == "model":
+                if len(posix.parts) != 2:
+                    raise ValueError(
+                        f"Refusing to import {zip_path}: model entry must be "
+                        f"directly inside model/: {entry.filename!r}"
+                    )
+                model_entries += 1
+                if model_entries > 1:
+                    raise ValueError(
+                        f"Refusing to import {zip_path}: multiple model entries"
+                    )
                 model_basename = posix.parts[-1]
                 suffix = Path(model_basename).suffix.lower()
-                is_legacy_zip = model_basename.lower() == _LEGACY_ZIP_MODEL_NAME
-                if suffix not in _VALID_MODEL_EXTS and not is_legacy_zip:
+                is_zip_checkpoint = _is_zip_checkpoint_name(
+                    model_basename,
+                    community_download=community_download,
+                )
+                if (
+                    not community_download
+                    and suffix not in _VALID_MODEL_EXTS
+                    and not is_zip_checkpoint
+                ):
                     raise ValueError(
                         f"Refusing to import {zip_path}: unexpected model entry "
                         f"{entry.filename!r}"
@@ -477,6 +524,12 @@ def import_model(
         model = model_from_export_dict(manifest.get("ModelInfo") or {})
         if model.model_mode not in SUPPORTED_MODEL_MODES:
             model.model_mode = "convnext_tiny"
+
+        # A Community download belongs to its publisher even though the
+        # publisher's own manifest commonly says Standard.  Plain ZIP imports
+        # remain locally owned/restorable.
+        if community_download:
+            model.model_type = "CommunityManaged"
 
         existing = (
             model_repo.find_by_community_uid(model.community_model_uid)
@@ -545,7 +598,10 @@ def import_model(
                 # Standardize on `<model_id>.pth` so the runtime knows where to look
                 # regardless of what the exporter named the file.
                 suffix = Path(model_basename).suffix.lower()
-                if model_basename.lower() == _LEGACY_ZIP_MODEL_NAME:
+                if community_download or _is_zip_checkpoint_name(
+                    model_basename,
+                    community_download=community_download,
+                ):
                     suffix = ".pth"
                 elif not suffix:
                     suffix = ".pth"

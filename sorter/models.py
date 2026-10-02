@@ -144,6 +144,39 @@ class ImageProcessingConfig:
 
 
 @dataclass
+class CheckpointEnv:
+    """Library versions recorded when a model checkpoint was trained.
+
+    Empty values mean the information was not recorded, which preserves
+    compatibility with older and third-party checkpoints.
+    """
+
+    torch: str = ""
+    torchvision: str = ""
+    numpy: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "CheckpointEnv":
+        if not data:
+            return cls()
+
+        def _pick(name: str) -> str:
+            return str(data.get(name) or data.get(f"{name}_version") or "")
+
+        return cls(
+            torch=_pick("torch"),
+            torchvision=_pick("torchvision"),
+            numpy=_pick("numpy"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def is_empty(self) -> bool:
+        return not (self.torch or self.torchvision or self.numpy)
+
+
+@dataclass
 class AIModelConfig:
     """OpenAI-compatible HTTP endpoint settings, persisted per-model."""
     endpoint_url: str = ""
@@ -290,6 +323,7 @@ class Model:
     feedback_loop_confidence_floor: int = 95
     feedback_loop_upload_mode: str = "Manual"
     model_path: str | None = None
+    checkpoint_env: CheckpointEnv = field(default_factory=CheckpointEnv)
 
     @classmethod
     def from_row(cls, row: Any) -> "Model":
@@ -303,6 +337,7 @@ class Model:
             except (TypeError, ValueError):
                 return None
 
+        keys = row.keys()
         return cls(
             id=row["id"],
             name=row["name"],
@@ -329,4 +364,25 @@ class Model:
                 feedback_enabled=bool(row["feedback_loop_enabled"]),
             ),
             model_path=row["model_path"],
+            checkpoint_env=CheckpointEnv.from_dict(
+                _parse(row["checkpoint_env_json"])
+                if "checkpoint_env_json" in keys else None
+            ),
+        )
+
+
+@dataclass
+class ApiModelAlias:
+    """A stable network name mapped to one installed local model."""
+
+    alias: str
+    model_id: int
+    preload: bool = False
+
+    @classmethod
+    def from_row(cls, row: Any) -> "ApiModelAlias":
+        return cls(
+            alias=str(row["alias"]),
+            model_id=int(row["model_id"]),
+            preload=bool(row["preload"]),
         )

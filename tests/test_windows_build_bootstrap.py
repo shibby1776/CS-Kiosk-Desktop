@@ -40,13 +40,46 @@ class WindowsBuildBootstrapTests(unittest.TestCase):
             self.script,
         )
         self.assertIn(
-            '"%PY_EXE%" %PY_ARGS% -m PyInstaller',
+            '"%CPU_PY%" -m PyInstaller',
             self.script,
         )
         self.assertIn(
-            '"%PY_EXE%" %PY_ARGS% -m unittest discover',
+            '"%CUDA_PY%" -m PyInstaller',
             self.script,
         )
+        self.assertIn(
+            '"%CPU_PY%" -m unittest discover',
+            self.script,
+        )
+
+    def test_build_produces_pinned_cpu_and_cuda_payloads(self) -> None:
+        self.assertIn('requirements-torch-%CACHE_PROFILE%.txt', self.script)
+        cache_helper = (ROOT / "build_dependency_cache.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('PROFILES = ("cpu", "cuda")', cache_helper)
+        self.assertIn('f"requirements-torch-{profile}.txt"', cache_helper)
+        self.assertIn("--distpath dist_cpu", self.script)
+        self.assertIn("--distpath dist_cuda", self.script)
+        self.assertIn("--expect-runtime cpu", self.script)
+        self.assertIn("--expect-runtime cuda", self.script)
+        self.assertIn("assert torch.version.cuda", self.script)
+
+    def test_build_reuses_fingerprinted_dependency_environments(self) -> None:
+        self.assertIn("build_dependency_cache.py prepare", self.script)
+        self.assertIn("build_dependency_cache.py mark", self.script)
+        self.assertIn("SHIBBYPRINTS_BUILD_CACHE", self.script)
+        self.assertIn("SHIBBYPRINTS_REBUILD_DEPENDENCIES", self.script)
+        self.assertIn("PIP_CACHE_DIR", self.script)
+        self.assertNotIn("--no-cache-dir", self.script)
+        self.assertNotIn("--force-reinstall", self.script)
+
+    def test_build_requires_and_probes_packaged_training_workers(self) -> None:
+        self.assertGreaterEqual(
+            self.script.count("ShibbyPrintsTrainingWorker.exe"), 4
+        )
+        self.assertIn("--training-worker --help", self.script)
+        self.assertIn('findstr /C:"ConvNeXt trainer"', self.script)
 
 
 if __name__ == "__main__":

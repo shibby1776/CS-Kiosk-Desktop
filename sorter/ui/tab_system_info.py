@@ -13,7 +13,9 @@ SOFTWARE_VERSION = PUBLIC_VERSION
 FIRMWARE_VERSION = "CS7.2"
 
 
-def _pi_model() -> str:
+def _computer_model() -> str:
+    if platform.system() == "Windows":
+        return platform.processor() or platform.machine() or "Windows PC"
     for path in (Path("/proc/device-tree/model"), Path("/sys/firmware/devicetree/base/model")):
         try:
             value = path.read_bytes().decode("utf-8", "replace").rstrip("\x00").strip()
@@ -25,6 +27,29 @@ def _pi_model() -> str:
 
 
 def _installed_ram() -> str:
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+
+            class _MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return f"{status.ullTotalPhys / (1024 ** 3):.1f} GB"
+        except Exception:
+            pass
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemTotal:"):
@@ -41,6 +66,8 @@ class SystemInfoTab(ttk.Frame):
 
     def __init__(self, parent, *, config=None, bus=None, app=None) -> None:
         super().__init__(parent, padding=24)
+        self.config = config
+        self.app = app
         self.columnconfigure(1, weight=1)
 
         ttk.Label(self, text="System Information", style="Header.TLabel").grid(
@@ -49,7 +76,7 @@ class SystemInfoTab(ttk.Frame):
         rows = (
             ("Software", SOFTWARE_VERSION),
             ("Firmware", FIRMWARE_VERSION),
-            ("Raspberry Pi model", _pi_model()),
+            ("Computer", _computer_model()),
             ("Installed RAM", _installed_ram()),
         )
         for row, (label, value) in enumerate(rows, start=1):

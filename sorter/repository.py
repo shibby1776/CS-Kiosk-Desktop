@@ -12,6 +12,7 @@ from typing import Any
 from .db import Database
 from .models import (
     AIModelConfig,
+    ApiModelAlias,
     Cartridge,
     Headstamp,
     HeadstampParent,
@@ -68,8 +69,8 @@ class ModelRepo:
     """CRUD for models, plus active-model selection.
 
     Active-model invariants enforced here:
-      - delete refuses to remove the last model of a cartridge
-      - delete refuses to remove the active model unless a replacement is given
+      - a served model must be removed from the API server first
+      - deleting the active model selects a replacement or AI Config
     """
 
     def __init__(self, db: Database) -> None:
@@ -135,8 +136,9 @@ class ModelRepo:
                 use_primer_mask, hide_primer, primer_mask_size,
                 last_training_date, last_training_duration, trained_image_count,
                 training_confusion_table, feedback_loop_enabled,
-                feedback_loop_confidence_floor, feedback_loop_upload_mode, model_path
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                feedback_loop_confidence_floor, feedback_loop_upload_mode, model_path,
+                checkpoint_env_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 model.name,
@@ -160,6 +162,7 @@ class ModelRepo:
                 model.feedback_loop_confidence_floor,
                 model.feedback_loop_upload_mode,
                 model.model_path,
+                json.dumps(model.checkpoint_env.to_dict()),
             ),
         )
         model.id = cur.lastrowid
@@ -182,6 +185,7 @@ class ModelRepo:
                 trained_image_count = ?, training_confusion_table = ?,
                 feedback_loop_enabled = ?, feedback_loop_confidence_floor = ?,
                 feedback_loop_upload_mode = ?, model_path = ?,
+                checkpoint_env_json = ?,
                 updated_at = datetime('now')
             WHERE id = ?
             """,
@@ -207,35 +211,118 @@ class ModelRepo:
                 model.feedback_loop_confidence_floor,
                 model.feedback_loop_upload_mode,
                 model.model_path,
+                json.dumps(model.checkpoint_env.to_dict()),
                 model.id,
             ),
         )
 
-    def delete(self, model_id: int, *, replacement_active_id: int | None = None) -> None:
-        """Delete a model. Refuses when:
+    def delete(
+        self,
+        model_id: int,
+        *,
+        replacement_active_id: int | None = None,
+    ) -> bool:
+        """Delete a model and return whether AI Config became active.
 
-        - the model is the last one in its cartridge
-        - the model is currently active and no `replacement_active_id` is given
+        A cartridge may intentionally have no installed models. If the deleted
+        model is active, select ``replacement_active_id`` when supplied;
+        otherwise clear the active selection and safely return to AI Config.
         """
         existing = self.get(model_id)
         if existing is None:
-            return
-        siblings = self.count_in_cartridge(existing.cartridge_id)
-        if siblings <= 1:
+            return False
+        served_as = ApiModelAliasRepo(self.db).aliases_for_model(model_id)
+        if served_as:
+            names = ", ".join(item.alias for item in served_as)
             raise ValueError(
-                "Cannot delete the last model in a cartridge. Add another model first."
+                f"Cannot delete this model while it is available through the "
+                f"API server as {names}. Remove or reassign the server name first."
             )
         settings_repo = SettingsRepo(self.db)
-        if settings_repo.get_active_model_id() == model_id:
-            if replacement_active_id is None:
-                raise ValueError(
-                    "Cannot delete the active model. Activate another model first."
-                )
-            replacement = self.get(replacement_active_id)
-            if replacement is None or replacement.id == model_id:
-                raise ValueError("Replacement model not found.")
-            settings_repo.set_active_model_id(replacement.id)
-        self.db.conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
+        active_cleared = False
+        with self.db.transaction():
+            if settings_repo.get_active_model_id() == model_id:
+                if replacement_active_id is None:
+                    settings_repo.clear_active_model()
+                    active_cleared = True
+                else:
+                    replacement = self.get(replacement_active_id)
+                    if replacement is None or replacement.id == model_id:
+                        raise ValueError("Replacement model not found.")
+                    settings_repo.set_active_model_id(replacement.id)
+            self.db.conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
+        return active_cleared
+
+
+class ApiModelAliasRepo:
+    """CRUD for stable API names mapped to installed local models."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def list(self) -> list[ApiModelAlias]:
+        rows = self.db.conn.execute(
+            "SELECT alias, model_id, preload FROM api_model_aliases "
+            "ORDER BY alias COLLATE NOCASE"
+        ).fetchall()
+        return [ApiModelAlias.from_row(row) for row in rows]
+
+    def get(self, alias: str) -> ApiModelAlias | None:
+        row = self.db.conn.execute(
+            "SELECT alias, model_id, preload FROM api_model_aliases "
+            "WHERE alias = ? COLLATE NOCASE",
+            (str(alias).strip(),),
+        ).fetchone()
+        return ApiModelAlias.from_row(row) if row else None
+
+    def aliases_for_model(self, model_id: int) -> list[ApiModelAlias]:
+        rows = self.db.conn.execute(
+            "SELECT alias, model_id, preload FROM api_model_aliases "
+            "WHERE model_id = ? ORDER BY alias COLLATE NOCASE",
+            (int(model_id),),
+        ).fetchall()
+        return [ApiModelAlias.from_row(row) for row in rows]
+
+    def assign(self, alias: str, model_id: int, *, preload: bool = False) -> ApiModelAlias:
+        clean = str(alias or "").strip()
+        if not clean:
+            raise ValueError("API model name is required.")
+        if len(clean) > 128 or clean in {".", ".."}:
+            raise ValueError("API model name is invalid.")
+        if any(char in clean for char in "/\\\0\r\n"):
+            raise ValueError("API model name contains unsupported characters.")
+        model = ModelRepo(self.db).get(int(model_id))
+        if model is None:
+            raise ValueError("The selected local model no longer exists.")
+        if not model.model_path:
+            raise ValueError("The selected model does not have a trained checkpoint.")
+        self.db.conn.execute(
+            """
+            INSERT INTO api_model_aliases(alias, model_id, preload)
+            VALUES (?, ?, ?)
+            ON CONFLICT(alias) DO UPDATE SET
+              model_id = excluded.model_id,
+              preload = excluded.preload,
+              updated_at = datetime('now')
+            """,
+            (clean, int(model_id), int(bool(preload))),
+        )
+        return ApiModelAlias(clean, int(model_id), bool(preload))
+
+    def set_preload(self, alias: str, preload: bool) -> None:
+        cur = self.db.conn.execute(
+            "UPDATE api_model_aliases SET preload = ?, updated_at = datetime('now') "
+            "WHERE alias = ? COLLATE NOCASE",
+            (int(bool(preload)), str(alias).strip()),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("API model assignment was not found.")
+
+    def remove(self, alias: str) -> None:
+        self.db.conn.execute(
+            "DELETE FROM api_model_aliases WHERE alias = ? COLLATE NOCASE",
+            (str(alias).strip(),),
+        )
 
 
 class HeadstampRepo:

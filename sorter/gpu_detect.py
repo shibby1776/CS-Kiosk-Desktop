@@ -12,9 +12,9 @@ import subprocess
 from dataclasses import dataclass
 
 
-# RTX 30-series (Ampere) is sm_80+ and is the first generation supported by
-# the cu128 wheel index. Older cards (Turing sm_75 and below) would need a
-# different wheel set and we don't support that flow.
+# RTX 30-series (Ampere) is sm_80+. This installer deliberately limits the
+# CUDA 13.0 evaluation path to that reviewed hardware generation or newer;
+# older cards require a separate wheel/driver validation matrix.
 MIN_CUDA_COMPUTE = 8.0
 
 

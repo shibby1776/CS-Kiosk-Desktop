@@ -1,7 +1,7 @@
 """AI Config tab — split layout.
 
 Left column:  server connection settings + prompt + image encoding + Save.
-Top right:    headstamp list management (add, remove, clear, load).
+Top right:    read-only server-provided headstamp list and reload.
 Bottom:       single-shot test (Feed -> capture -> crop -> classify), reusing
               the same bus events the old Test tab subscribed to.
 """
@@ -44,8 +44,18 @@ class AiTab(ttk.Frame):
         self.apikey_var.set(api_cfg.get("api_key", ""))
         row2.pack(side=tk.TOP, fill=tk.X, padx=8, pady=2)
 
-        row3, self.model_var = build_labeled_entry(conn, "Model", width=30)
-        self.model_var.set(api_cfg.get("model", ""))
+        row3 = ttk.Frame(conn)
+        ttk.Label(row3, text="Model", width=18, anchor=tk.W).pack(side=tk.LEFT)
+        self.model_var = tk.StringVar(value=api_cfg.get("model", ""))
+        self.model_combo = ttk.Combobox(
+            row3, textvariable=self.model_var, width=28, state="normal",
+        )
+        self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            row3,
+            text="Connect and Find Models",
+            command=self.find_models,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         row3.pack(side=tk.TOP, fill=tk.X, padx=8, pady=2)
 
         prompt = ttk.LabelFrame(left, text="Prompt (use {{headstamps}} to inject the list)")
@@ -76,13 +86,8 @@ class AiTab(ttk.Frame):
 
         add_row = ttk.Frame(right)
         add_row.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
-        ttk.Label(add_row, text="New:").pack(side=tk.LEFT)
-        self.new_name_var = tk.StringVar()
-        entry = ttk.Entry(add_row, textvariable=self.new_name_var, width=18)
-        entry.pack(side=tk.LEFT, padx=6)
-        entry.bind("<Return>", lambda _e: self.add_headstamp())
-        ttk.Button(add_row, text="Add", command=self.add_headstamp)\
-            .pack(side=tk.LEFT, padx=2)
+        ttk.Label(add_row, text="Classifications are managed by the AI server.",
+                  style="Muted.TLabel").pack(side=tk.LEFT)
         ttk.Button(add_row, text="Load from server", command=self.load_headstamps)\
             .pack(side=tk.RIGHT, padx=2)
 
@@ -102,18 +107,9 @@ class AiTab(ttk.Frame):
         scroll.config(command=self.listbox.yview)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.listbox.bind("<Delete>", lambda _e: self.remove_selected())
-        self.listbox.bind("<<ListboxSelect>>", self._on_select_changed)
 
         side = ttk.Frame(list_row)
         side.pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        self.remove_btn = ttk.Button(
-            side, text="Remove selected", command=self.remove_selected, state=tk.DISABLED,
-        )
-        self.remove_btn.pack(side=tk.TOP, fill=tk.X, pady=2)
-        ttk.Button(side, text="Clear all", command=self.clear_all)\
-            .pack(side=tk.TOP, fill=tk.X, pady=2)
-        ttk.Separator(side, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, pady=8)
         self.count_var = tk.StringVar(value="0 headstamps")
         ttk.Label(side, textvariable=self.count_var, style="Muted.TLabel")\
             .pack(side=tk.TOP, anchor=tk.W)
@@ -188,51 +184,10 @@ class AiTab(ttk.Frame):
         self.count_var.set(
             f"{len(names)} headstamp" + ("" if len(names) == 1 else "s")
         )
-        self._on_select_changed()
 
     def refresh_saved_bins_runtime(self) -> None:
         """Refresh the remote-label list after a Saved Bins load."""
         self._refresh_list()
-
-    def _on_select_changed(self, _event=None) -> None:
-        has_selection = bool(self.listbox.curselection())
-        self.remove_btn.configure(state=tk.NORMAL if has_selection else tk.DISABLED)
-
-    # ----- headstamp actions --------------------------------------------------
-
-    def add_headstamp(self) -> None:
-        name = self.new_name_var.get().strip()
-        if not name:
-            return
-        if not self.config.add_headstamp(name):
-            # Either AI Config mode (no active model) or duplicate name.
-            self.app.set_status(f"Could not add '{name}'.")
-            return
-        self.new_name_var.set("")
-        self._refresh_list()
-        self.app.set_status(f"Added '{name}'.")
-
-    def remove_selected(self) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
-            return
-        name = self.listbox.get(selection[0])
-        self.config.remove_headstamp(name)
-        self._refresh_list()
-        self.app.set_status(f"Removed '{name}'.")
-
-    def clear_all(self) -> None:
-        current = self.config.headstamps
-        if not current:
-            return
-        if not messagebox.askyesno(
-            "Clear all headstamps",
-            f"Remove all {len(current)} headstamp(s)?",
-        ):
-            return
-        self.config.clear_headstamps()
-        self._refresh_list()
-        self.app.set_status("Cleared all headstamps.")
 
     # ----- Save / Load --------------------------------------------------------
 
@@ -258,6 +213,44 @@ class AiTab(ttk.Frame):
             lambda: api_client.get_headstamps(endpoint, model, api_key),
             on_done=self._on_headstamps_loaded,
             on_error=lambda err: messagebox.showerror("Server error", str(err)),
+        )
+
+    def find_models(self) -> None:
+        endpoint = self.endpoint_var.get().strip()
+        api_key = self.apikey_var.get().strip()
+        if not endpoint:
+            messagebox.showerror("Missing value", "Endpoint URL is required.")
+            return
+        self.app.set_status("Finding available server models…")
+        self.app.run_worker(
+            lambda: api_client.list_models(endpoint, api_key),
+            on_done=self._on_models_loaded,
+            on_error=lambda err: messagebox.showerror("Server error", str(err)),
+        )
+
+    def _on_models_loaded(self, names) -> None:
+        available = list(names)
+        self.model_combo["values"] = available
+        current = self.model_var.get().strip()
+        if not available:
+            self.app.set_status("The server is available but advertises no models.")
+            messagebox.showinfo(
+                "No models available",
+                "The server is running but no models are currently available.",
+            )
+            return
+        if not current:
+            self.model_var.set(available[0])
+        elif current not in available:
+            messagebox.showwarning(
+                "Configured model not advertised",
+                f'The server did not advertise the currently configured model "{current}". '
+                "It was not changed. Select an available model and press Save if you want "
+                "to switch.",
+                parent=self,
+            )
+        self.app.set_status(
+            f"Found {len(available)} server model(s). Select one and press Save."
         )
 
     def _on_headstamps_loaded(self, names) -> None:

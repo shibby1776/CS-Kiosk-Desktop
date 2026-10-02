@@ -33,7 +33,12 @@ class WindowsInstallerTests(unittest.TestCase):
         )
         self.assertNotRegex(script, r"(?i)InstallDelete.*(?:appdata|documents)")
         self.assertIn(
-            'Source: "dist\\ShibbyPrintsCaseSorter\\*"; '
+            'Source: "c\\*"; '
+            'DestDir: "{app}\\app"',
+            script,
+        )
+        self.assertIn(
+            'Source: "g\\*"; '
             'DestDir: "{app}\\app"',
             script,
         )
@@ -62,10 +67,12 @@ class WindowsInstallerTests(unittest.TestCase):
         build = (ROOT / "build_installer.bat").read_text(encoding="utf-8")
 
         self.assertIn("call build_windows.bat --no-pause", build)
-        self.assertIn('findstr /B /C:"DESKTOP_VERSION=" "RELEASE.env"', build)
+        self.assertIn('findstr /B /C:"APP_VERSION=" "RELEASE.env"', build)
         self.assertIn('findstr /B /C:"KIOSK_VERSION=" "RELEASE.env"', build)
+        self.assertIn("INSTALLER_SUFFIX", build)
         self.assertIn(
-            "ShibbyPrints-Kiosk-%PUBLIC_VERSION%-Public-Setup.exe", build
+            "ShibbyPrints-Kiosk-%PUBLIC_VERSION%-%INSTALLER_SUFFIX%-Setup.exe",
+            build,
         )
         self.assertIn(
             '"%ISCC_EXE%" "%STAGE_ROOT%\\ShibbyPrintsCaseSorterInstaller.iss"',
@@ -81,11 +88,12 @@ class WindowsInstallerTests(unittest.TestCase):
 
         self.assertIn('if /I "%~1"=="--compile-only"', build)
         self.assertIn('set "STAGE_ROOT=%TEMP%\\SPI-%RANDOM%-%RANDOM%"', build)
-        self.assertIn('robocopy "%CD%\\dist\\ShibbyPrintsCaseSorter"', build)
+        self.assertIn('robocopy "%CD%\\dist_cpu\\ShibbyPrintsCaseSorter"', build)
+        self.assertIn('robocopy "%CD%\\dist_cuda\\ShibbyPrintsCaseSorter"', build)
         self.assertIn('rmdir /S /Q "%STAGE_ROOT%"', build)
         self.assertNotIn("subst ", build.casefold())
         self.assertIn(
-            'dist\\ShibbyPrintsCaseSorter\\ShibbyPrintsCaseSorter.exe',
+            'dist_cpu\\ShibbyPrintsCaseSorter\\ShibbyPrintsCaseSorter.exe',
             build,
         )
         self.assertIn('build_installer.bat" --compile-only', recovery)
@@ -95,13 +103,13 @@ class WindowsInstallerTests(unittest.TestCase):
 
         staged = build.index('set "STAGED_SETUP=')
         copied = build.index('copy /Y "%STAGED_SETUP%" "%SETUP_EXE%"')
-        cleaned = build.index("call :remove_physical_stage", copied)
+        cleaned = build.index('rmdir /S /Q "%STAGE_ROOT%"', copied)
         self.assertLess(staged, copied)
         self.assertLess(copied, cleaned)
 
     def test_generated_installer_version_matches_release_metadata(self) -> None:
         release = (ROOT / "RELEASE.env").read_text(encoding="utf-8")
-        version = re.search(r"(?m)^DESKTOP_VERSION=(.+)$", release).group(1)
+        version = re.search(r"(?m)^APP_VERSION=(.+)$", release).group(1)
         public_version = re.search(
             r"(?m)^KIOSK_VERSION=(.+)$", release
         ).group(1)
@@ -109,6 +117,40 @@ class WindowsInstallerTests(unittest.TestCase):
 
         self.assertIn(f'#define MyAppVersion "{version}"', generated)
         self.assertIn(f'#define MyPublicVersion "{public_version}"', generated)
+        self.assertIn('#define MyDisplayVersion "Kiosk 2.3"', generated)
+        self.assertIn('#define MyInstallerSuffix "Public"', generated)
+
+    def test_installer_selects_cuda_only_for_a_supported_nvidia_gpu(self) -> None:
+        script = (ROOT / "ShibbyPrintsCaseSorterInstaller.iss").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('Name: "cuda"', script)
+        self.assertIn('Check: SupportedCudaGpu', script)
+        self.assertIn('nvidia-smi --query-gpu=name,compute_cap', script)
+        self.assertIn('MajorCapability >= 8', script)
+        self.assertIn('Tasks: not cuda', script)
+        self.assertIn('Tasks: cuda', script)
+        self.assertIn('--test-cuda-device', script)
+
+    def test_installer_firewall_rules_are_private_and_removed(self) -> None:
+        script = (ROOT / "ShibbyPrintsCaseSorterInstaller.iss").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('Name: "lanaccess"', script)
+        self.assertIn('profile=private', script)
+        self.assertIn('remoteip=localsubnet', script)
+        self.assertIn('protocol=TCP', script)
+        self.assertIn('protocol=UDP localport=5353', script)
+        self.assertIn('[UninstallRun]', script)
+        self.assertIn('ArchitecturesAllowed=x64compatible', script)
+        self.assertIn('ArchitecturesInstallIn64BitMode=x64compatible', script)
+        self.assertEqual(2, script.count('RunOnceId:'))
+        self.assertGreaterEqual(
+            script.count('firewall delete rule name=""ShibbyPrints Kiosk Sorter'),
+            4,
+        )
 
 
 if __name__ == "__main__":

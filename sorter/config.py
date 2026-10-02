@@ -126,6 +126,8 @@ _RUN_AUTO_SELECT_KEY = "run_auto_select_trays"
 # Sort While Training: send xf:<slot> for a labelled case instead of xf:0
 # during training.
 _SORT_WHILE_TRAINING_KEY = "sort_while_training"
+_SOFTWARE_PROFILE_KEY = "software_profile"
+SOFTWARE_PROFILES = ("classification_only", "full")
 
 
 def _merge_defaults(defaults: Any, loaded: Any) -> Any:
@@ -608,6 +610,24 @@ class Config:
 
     def set_sort_while_training(self, value: bool) -> None:
         self.settings.set(_SORT_WHILE_TRAINING_KEY, bool(value))
+
+    @property
+    def software_profile(self) -> str:
+        value = str(self.settings.get(_SOFTWARE_PROFILE_KEY, "full") or "full")
+        return value if value in SOFTWARE_PROFILES else "full"
+
+    def set_software_profile(self, value: str) -> None:
+        if value not in SOFTWARE_PROFILES:
+            raise ValueError("Software profile must be classification_only or full.")
+        self.settings.set(_SOFTWARE_PROFILE_KEY, value)
+
+    @property
+    def training_tools_visible(self) -> bool:
+        """Training exists only for a local model in the Full profile."""
+        return (
+            self.software_profile == "full"
+            and self.settings.get_active_model_id() is not None
+        )
 
     # ----- empty-slot discovery (auto-select trays) --------------------------
 

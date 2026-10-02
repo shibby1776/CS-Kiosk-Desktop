@@ -80,11 +80,14 @@ class ScrollableFrame(ttk.Frame):
 
         self.body.bind("<Configure>", self._on_body_configure)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
-        # Pointer-driven wheel binding: only the canvas currently under the
-        # mouse claims the wheel — keeps wheel scrolling intuitive when
-        # other scrollable widgets (e.g. the slot-details panel) sit inside.
-        self._canvas.bind("<Enter>", self._bind_mousewheel)
-        self._canvas.bind("<Leave>", self._unbind_mousewheel)
+        # Toplevel bindings receive events over labels/cards as well as the
+        # canvas itself. Each scroller only handles its own nearest subtree.
+        self._wheel_root = self.winfo_toplevel()
+        self._wheel_bindings = {
+            sequence:self._wheel_root.bind(sequence,self._on_mousewheel,add='+')
+            for sequence in ('<MouseWheel>','<Button-4>','<Button-5>')
+        }
+        self.bind('<Destroy>',self._remove_wheel_bindings,add='+')
 
     def _on_canvas_configure(self, event: tk.Event) -> None:
         body_h = self.body.winfo_reqheight()
@@ -95,6 +98,11 @@ class ScrollableFrame(ttk.Frame):
         )
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
+    def refresh_scroll_region(self):
+        if not self.winfo_exists():
+            return
+        self._on_body_configure(None)
+
     def _on_body_configure(self, _event: tk.Event) -> None:
         canvas_h = self._canvas.winfo_height()
         body_h = self.body.winfo_reqheight()
@@ -104,27 +112,36 @@ class ScrollableFrame(ttk.Frame):
         )
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))
 
-    def _bind_mousewheel(self, _event: tk.Event) -> None:
-        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-        self._canvas.bind_all("<Button-4>", self._on_mousewheel)
-        self._canvas.bind_all("<Button-5>", self._on_mousewheel)
-
-    def _unbind_mousewheel(self, _event: tk.Event) -> None:
-        self._canvas.unbind_all("<MouseWheel>")
-        self._canvas.unbind_all("<Button-4>")
-        self._canvas.unbind_all("<Button-5>")
+    def _remove_wheel_bindings(self,event):
+        if event.widget is not self:
+            return
+        for sequence,identifier in self._wheel_bindings.items():
+            try:self._wheel_root.unbind(sequence,identifier)
+            except tk.TclError:pass
+        self._wheel_bindings.clear()
 
     def _on_mousewheel(self, event: tk.Event) -> None:
+        widget = event.widget
+        while widget is not None and widget is not self:
+            if isinstance(widget,ScrollableFrame):
+                return
+            if isinstance(widget,(tk.Canvas,tk.Text,tk.Listbox,ttk.Combobox,ttk.Spinbox,ttk.Treeview)) and widget is not self._canvas:
+                return
+            widget=getattr(widget,'master',None)
+        if widget is not self:
+            return
         # If everything fits, leave the wheel alone so it can drive other
         # widgets (combobox dropdowns, the slot-details inner scroll, etc.).
         first, last = self._canvas.yview()
         if first <= 0.0 and last >= 1.0:
             return
         delta = getattr(event, "delta", 0)
-        if event.num == 4 or delta > 0:
+        if getattr(event, "num", None) == 4 or delta > 0:
             self._canvas.yview_scroll(-3, "units")
-        elif event.num == 5 or delta < 0:
+            return 'break'
+        elif getattr(event, "num", None) == 5 or delta < 0:
             self._canvas.yview_scroll(3, "units")
+            return 'break'
 
 
 class ImagePanel(ttk.Frame):

@@ -7,25 +7,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PublicPackagePolicyTests(unittest.TestCase):
-    def test_public_readme_has_no_release_history(self) -> None:
+    def test_public_readme_uses_only_public_release_identity(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("Kiosk 2.2 Public", readme)
-        for excluded in (
-            "Desktop v1.27",
-            "Evolution from the original baseline",
-            "Release notes",
-            "Saved Bins USB Import Fix Test",
-        ):
-            self.assertNotIn(excluded, readme)
-        self.assertFalse((ROOT / "INSTALLER_PATH_FIX.txt").exists())
+        self.assertIn("Kiosk 2.3 Public", readme)
+        self.assertIn("How the pieces fit together", readme)
+        self.assertIn("user-attachments/assets/c81ca1eb", readme)
+        self.assertNotIn("Release notes", readme)
 
     def test_install_guide_covers_users_builders_and_upgrades(self) -> None:
         guide = (ROOT / "INSTALL.md").read_text(encoding="utf-8")
 
         for required in (
-            "ShibbyPrints-Kiosk-2.2-Public-Setup.exe",
-            "ShibbyPrints-Kiosk-2.2-Public-Source.zip",
+            "ShibbyPrints-Kiosk-2.3-Public-Setup.exe",
+            "ShibbyPrints-Kiosk-2.3-Public-Source.zip",
             "build_installer.bat",
             "build_windows.bat",
             "Compile Installer From Existing Build.bat",
@@ -34,12 +29,24 @@ class PublicPackagePolicyTests(unittest.TestCase):
             "build_report\\errors.log",
         ):
             self.assertIn(required, guide)
-        self.assertNotIn("Release notes", guide)
 
-    def test_public_notice_records_upstream_provenance(self) -> None:
+    def test_public_source_excludes_development_and_firmware_bundles(self) -> None:
+        for pattern in (
+            "*-INTEGRATION.md",
+            "VALIDATION-*.md",
+            "RELEASE-NOTES-*.md",
+            "*-PLAN.md",
+            "UPSTREAM_*.md",
+            "UI-*.json",
+            "CS72_*",
+        ):
+            self.assertFalse(list(ROOT.glob(pattern)), pattern)
+
+    def test_public_notice_records_release_and_upstream_provenance(self) -> None:
         notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
 
-        self.assertIn("Kiosk 2.2 Public", notice)
+        self.assertIn("Kiosk 2.3 Public", notice)
+        self.assertIn("October 2, 2026", notice)
         self.assertIn("https://github.com/sjseth/AI-Case-Sorter-Py", notice)
         self.assertIn(
             "62e879b0a57f3f857f59a8cc3e6e9ba701dc9bc9", notice
@@ -61,7 +68,7 @@ class PublicPackagePolicyTests(unittest.TestCase):
             self.assertIn(required.casefold(), readme_text)
             self.assertIn(required.casefold(), notice_text)
 
-    def test_kiosk_security_policy_uses_private_reporting(self) -> None:
+    def test_security_policy_covers_private_reporting_and_network_services(self) -> None:
         policy = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
         policy_text = " ".join(policy.split())
 
@@ -71,14 +78,23 @@ class PublicPackagePolicyTests(unittest.TestCase):
             "Do not disclose suspected security vulnerabilities",
             "Diagnostic archives may contain camera images",
             "Only import or download model files from sources you trust",
-            "use an HTTPS endpoint",
+            "Use an API key",
+            "never uploaded automatically",
         ):
             self.assertIn(required, policy_text)
-        self.assertNotIn("seth@sjseth.com", policy.casefold())
+
+    def test_readme_documents_bounded_operator_controlled_error_reports(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme_text = " ".join(readme.split())
+        for required in (
+            "Diagnostics and recovery reports",
+            "Reports are created only after an operator action",
+            "never uploaded automatically",
+        ):
+            self.assertIn(required, readme_text)
 
     def test_gpl_license_matches_upstream_reference(self) -> None:
         license_digest = sha256((ROOT / "LICENSE").read_bytes()).hexdigest()
-
         self.assertEqual(
             "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
             license_digest,

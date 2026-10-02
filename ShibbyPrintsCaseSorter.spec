@@ -10,6 +10,9 @@ hiddenimports = collect_submodules("sorter")
 # pygrabber discovers COM support dynamically on Windows.
 hiddenimports += collect_submodules("pygrabber")
 hiddenimports += collect_submodules("comtypes")
+# Imported only when Web Interface is enabled; collect it explicitly so the
+# friendly <sorter-name>.local address works in the packaged application.
+hiddenimports += collect_submodules("zeroconf")
 
 # Torch is imported lazily, so Analysis cannot discover it reliably. Explicitly
 # collect its binaries/data/submodules. ONEDIR keeps these files beside the EXE,
@@ -49,8 +52,21 @@ exe = EXE(
     console=False,
 )
 
+# Training runs in a separate console-subsystem executable so its redirected
+# stdout/stderr remain dependable. The manager launches it with
+# CREATE_NO_WINDOW, so operators never see a console or second application UI.
+training_worker_exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="ShibbyPrintsTrainingWorker",
+    console=True,
+)
+
 coll = COLLECT(
     exe,
+    training_worker_exe,
     a.binaries,
     a.datas,
     strip=False,

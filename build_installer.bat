@@ -11,15 +11,19 @@ if "%COMPILE_ONLY%"=="0" (
   if errorlevel 1 goto :build_failed
 ) else (
   echo [INSTALLER] Reusing the existing Windows application build...
-  if not exist "dist\ShibbyPrintsCaseSorter\ShibbyPrintsCaseSorter.exe" goto :existing_build_missing
+  if not exist "dist_cpu\ShibbyPrintsCaseSorter\ShibbyPrintsCaseSorter.exe" goto :existing_build_missing
+  if not exist "dist_cuda\ShibbyPrintsCaseSorter\ShibbyPrintsCaseSorter.exe" goto :existing_build_missing
 )
 
 set "APP_VERSION="
-for /f "tokens=2 delims==" %%V in ('findstr /B /C:"DESKTOP_VERSION=" "RELEASE.env"') do set "APP_VERSION=%%V"
+for /f "tokens=2 delims==" %%V in ('findstr /B /C:"APP_VERSION=" "RELEASE.env"') do set "APP_VERSION=%%V"
 if not defined APP_VERSION goto :version_missing
 set "PUBLIC_VERSION="
 for /f "tokens=2 delims==" %%V in ('findstr /B /C:"KIOSK_VERSION=" "RELEASE.env"') do set "PUBLIC_VERSION=%%V"
 if not defined PUBLIC_VERSION goto :version_missing
+set "INSTALLER_SUFFIX="
+for /f "tokens=3" %%V in ('findstr /B /C:"#define MyInstallerSuffix " "installer_version.iss"') do set "INSTALLER_SUFFIX=%%~V"
+if not defined INSTALLER_SUFFIX goto :version_missing
 
 set "ISCC_EXE="
 where ISCC.exe >nul 2>&1
@@ -33,7 +37,7 @@ if not defined ISCC_EXE (
   echo.
   echo Inno Setup 6 was not found.
   echo Install Inno Setup 6, then run build_installer.bat again.
-  echo The Windows application build remains available under dist.
+  echo The Windows application builds remain available under dist_cpu and dist_cuda.
   echo.
   pause
   exit /b 1
@@ -47,14 +51,16 @@ echo [INSTALLER] Using physical short-path staging at %STAGE_ROOT%.
 "%ISCC_EXE%" "%STAGE_ROOT%\ShibbyPrintsCaseSorterInstaller.iss"
 set "ISCC_RESULT=%ERRORLEVEL%"
 
-set "SETUP_EXE=%CD%\installer_output\ShibbyPrints-Kiosk-%PUBLIC_VERSION%-Public-Setup.exe"
-set "STAGED_SETUP=%STAGE_ROOT%\installer_output\ShibbyPrints-Kiosk-%PUBLIC_VERSION%-Public-Setup.exe"
+set "SETUP_EXE=%CD%\installer_output\ShibbyPrints-Kiosk-%PUBLIC_VERSION%-%INSTALLER_SUFFIX%-Setup.exe"
+set "STAGED_SETUP=%STAGE_ROOT%\installer_output\ShibbyPrints-Kiosk-%PUBLIC_VERSION%-%INSTALLER_SUFFIX%-Setup.exe"
 if not "%ISCC_RESULT%"=="0" goto :staged_installer_failed
 if not exist "%STAGED_SETUP%" goto :staged_installer_missing
 if not exist "%CD%\installer_output" mkdir "%CD%\installer_output" >nul 2>&1
 copy /Y "%STAGED_SETUP%" "%SETUP_EXE%" >nul
 if errorlevel 1 goto :staged_installer_copy_failed
-call :remove_physical_stage
+if exist "%STAGE_ROOT%\" rmdir /S /Q "%STAGE_ROOT%" >nul 2>&1
+set "STAGE_ROOT="
+set "STAGED_SETUP="
 if not exist "%SETUP_EXE%" goto :installer_missing
 
 echo.
@@ -74,7 +80,7 @@ exit /b 1
 
 :existing_build_missing
 echo.
-echo The existing application build was not found under dist\ShibbyPrintsCaseSorter.
+echo Both CPU and CUDA application builds are required under dist_cpu and dist_cuda.
 echo Run build_installer.bat without --compile-only to build everything.
 pause
 exit /b 1
@@ -86,15 +92,21 @@ pause
 exit /b 1
 
 :staged_installer_failed
-call :remove_physical_stage
+if exist "%STAGE_ROOT%\" rmdir /S /Q "%STAGE_ROOT%" >nul 2>&1
+set "STAGE_ROOT="
+set "STAGED_SETUP="
 goto :installer_failed
 
 :staged_installer_missing
-call :remove_physical_stage
+if exist "%STAGE_ROOT%\" rmdir /S /Q "%STAGE_ROOT%" >nul 2>&1
+set "STAGE_ROOT="
+set "STAGED_SETUP="
 goto :installer_missing
 
 :staged_installer_copy_failed
-call :remove_physical_stage
+if exist "%STAGE_ROOT%\" rmdir /S /Q "%STAGE_ROOT%" >nul 2>&1
+set "STAGE_ROOT="
+set "STAGED_SETUP="
 echo.
 echo The installer compiled, but it could not be copied to installer_output.
 pause
@@ -109,7 +121,7 @@ exit /b 1
 
 :version_missing
 echo.
-echo DESKTOP_VERSION or KIOSK_VERSION could not be read from RELEASE.env.
+echo Release version or installer suffix could not be read from generated metadata.
 pause
 exit /b 1
 
@@ -122,11 +134,14 @@ exit /b 1
 
 :create_physical_stage
 set "STAGE_ROOT=%TEMP%\SPI-%RANDOM%-%RANDOM%"
-mkdir "%STAGE_ROOT%\dist\ShibbyPrintsCaseSorter" >nul 2>&1
+mkdir "%STAGE_ROOT%\c" >nul 2>&1
+mkdir "%STAGE_ROOT%\g" >nul 2>&1
 if errorlevel 1 goto :physical_stage_creation_failed
 
-echo [INSTALLER] Copying the existing runtime to the short staging path...
-robocopy "%CD%\dist\ShibbyPrintsCaseSorter" "%STAGE_ROOT%\dist\ShibbyPrintsCaseSorter" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+echo [INSTALLER] Copying CPU and CUDA runtimes to the short staging path...
+robocopy "%CD%\dist_cpu\ShibbyPrintsCaseSorter" "%STAGE_ROOT%\c" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 goto :physical_stage_creation_failed
+robocopy "%CD%\dist_cuda\ShibbyPrintsCaseSorter" "%STAGE_ROOT%\g" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 goto :physical_stage_creation_failed
 
 copy /Y "%CD%\ShibbyPrintsCaseSorterInstaller.iss" "%STAGE_ROOT%\" >nul
@@ -142,11 +157,7 @@ if errorlevel 1 goto :physical_stage_creation_failed
 exit /b 0
 
 :physical_stage_creation_failed
-call :remove_physical_stage
-exit /b 1
-
-:remove_physical_stage
-if defined STAGE_ROOT if exist "%STAGE_ROOT%\" rmdir /S /Q "%STAGE_ROOT%" >nul 2>&1
+if exist "%STAGE_ROOT%\" rmdir /S /Q "%STAGE_ROOT%" >nul 2>&1
 set "STAGE_ROOT="
 set "STAGED_SETUP="
-exit /b 0
+exit /b 1

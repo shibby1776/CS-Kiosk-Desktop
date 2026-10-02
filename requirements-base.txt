@@ -1,0 +1,11 @@
+pyserial>=3.5
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+requests>=2.31
+msal>=1.28
+platformdirs>=4.0
+zeroconf>=0.131
+# Windows camera enumeration and its COM runtime are required in desktop builds.
+pygrabber>=0.2; platform_system == "Windows"
+comtypes>=1.2; platform_system == "Windows"

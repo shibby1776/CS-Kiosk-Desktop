@@ -122,6 +122,7 @@ class ImageProcTab(ttk.Frame):
         self.config.image_proc["primer_mode"] = self.primer_mode_var.get()
         self.config.image_proc["primer_radius"] = int(self.primer_radius.get())
         self.config.image_proc["hough"] = {
+            **dict(self.config.image_proc.get("hough",{})),
             "dp": float(self.hough_dp.get()),
             "min_dist": int(self.hough_min_dist.get()),
             "param1": float(self.hough_p1.get()),

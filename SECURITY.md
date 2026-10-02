@@ -19,7 +19,7 @@ Alternatively, email the report privately to **shibbyprints@gmail.com**.
 Include, when available:
 
 - the affected Kiosk version;
-- the internal version shown in an exported diagnostic report;
+- the application version shown in an exported diagnostic report;
 - the Windows version and system configuration;
 - a description of the problem and its potential impact;
 - clear steps to reproduce it; and
@@ -42,7 +42,7 @@ The following are separate systems and are not maintained by ShibbyPrints as
 part of this Kiosk release:
 
 - sorter hardware and firmware;
-- the local classification server;
+- external classification services;
 - the hosted community service; and
 - the original upstream desktop software.
 
@@ -61,9 +61,23 @@ contain filenames, classifications, and embedded image data.
 Diagnostic exports and evaluation reports should be treated as potentially
 sensitive files.
 
+The application keeps two bounded local event/error logs so an unexpected
+failure can be investigated after restart. Error-report ZIP files are created
+only after the operator agrees and are never uploaded automatically. API keys
+are masked, but exception messages and system details may still be sensitive;
+review the ZIP before sharing it.
+
 When using a classification server outside the local computer, use an HTTPS
 endpoint. Images and API credentials sent to an unencrypted remote HTTP
 endpoint may be visible to others on the network.
+
+## Browser and API Access
+
+The optional browser interface and integrated API server are intended for a
+trusted private network. Do not expose their ports directly to the Internet.
+Use an API key for client sorters when other untrusted devices can reach the
+same network, and keep Windows network discovery and firewall access limited to
+the private profile.
 
 ## Community Features
 

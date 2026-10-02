@@ -52,6 +52,7 @@ class EmulatorBroker:
         self.on_response: list[Callable[[str], None]] = []
         self.on_received: list[Callable[[str], None]] = []
         self.on_sent: list[Callable[[str], None]] = []
+        self.on_disconnect: list[Callable[[str], None]] = []
 
     # ----- lifecycle ----------------------------------------------------------
 
@@ -76,7 +77,9 @@ class EmulatorBroker:
 
     # ----- protocol -----------------------------------------------------------
 
-    def send_command(self, command: str) -> None:
+    def send_command(self, command: str) -> bool:
+        if not self.is_connected:
+            return False
         cmd = command.rstrip("\n")
         for cb in list(self.on_sent):
             try:
@@ -88,8 +91,22 @@ class EmulatorBroker:
         timer = threading.Timer(self._response_delay_s, self._fire_response_for, args=(cmd,))
         timer.daemon = True
         timer.start()
+        return True
+
+    def simulate_disconnect(self, reason: str = "emulated link lost") -> None:
+        """Test seam for a cable or board-power loss during a command."""
+        if not self.is_connected:
+            return
+        self.is_connected = False
+        for cb in list(self.on_disconnect):
+            try:
+                cb(reason)
+            except Exception:
+                pass
 
     def _fire_response_for(self, cmd: str) -> None:
+        if not self.is_connected:
+            return
         lower = cmd.lower()
         if lower in ("ping", "version"):
             self._dispatch("ok")
@@ -166,19 +183,32 @@ class EmulatorBroker:
         that window.
         """
         done = threading.Event()
+        hit = False
 
         def _hit(_payload: str) -> None:
+            nonlocal hit
+            hit = True
+            done.set()
+
+        def _abandon(_reason: str) -> None:
             done.set()
 
         handlers.append(_hit)
+        self.on_disconnect.append(_abandon)
         try:
-            self.send_command(command)
-            return done.wait(timeout=timeout_s)
+            if not self.send_command(command):
+                return False
+            done.wait(timeout=timeout_s)
+            return hit
         finally:
-            try:
-                handlers.remove(_hit)
-            except ValueError:
-                pass
+            for target, handler in (
+                (handlers, _hit),
+                (self.on_disconnect, _abandon),
+            ):
+                try:
+                    target.remove(handler)
+                except ValueError:
+                    pass
 
     def feed_one(self) -> bool:
         return self._send_and_await("xf:0", self.on_done, 2.0)

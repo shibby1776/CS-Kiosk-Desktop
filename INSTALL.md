@@ -1,45 +1,45 @@
-# Install or Build ShibbyPrints Kiosk 2.2
+# Install or Build ShibbyPrints Kiosk 2.3
 
-This guide covers the official 64-bit Windows release.
+This guide covers the official Kiosk 2.3 release for 64-bit Windows.
 
 ## Which file should I download?
 
 Most users need only:
 
-`ShibbyPrints-Kiosk-2.2-Public-Setup.exe`
+`ShibbyPrints-Kiosk-2.3-Public-Setup.exe`
 
 The Source ZIP is for developers, maintainers, and GPL corresponding-source
 access. It is not required to operate an installed sorter.
 
 ## Install the software
 
-1. Download `ShibbyPrints-Kiosk-2.2-Public-Setup.exe` from the official GitHub
+1. Download `ShibbyPrints-Kiosk-2.3-Public-Setup.exe` from the official GitHub
    release.
 2. Close any running copy of ShibbyPrints Kiosk Sorter.
 3. Double-click the downloaded Setup executable.
 4. Approve the Windows User Account Control prompt.
 5. Review the license and notice shown by Setup.
-6. Keep the default installation folder unless the machine requires a
-   different location.
-7. Leave **Create a desktop shortcut** selected if desired.
-8. Complete Setup and launch **ShibbyPrints Kiosk Sorter** from the Desktop or
-   Start Menu.
+6. Keep the default installation folder unless the computer requires another
+   location.
+7. Leave **Allow sorter Web/API access from this private network** selected if
+   this computer will provide browser access or the integrated API server.
+8. If Setup detects a supported NVIDIA GPU, choose whether to install NVIDIA
+   CUDA acceleration. Leave it selected for GPU inference and training.
+9. Leave **Create a desktop shortcut** selected if desired.
+10. Complete Setup and launch **ShibbyPrints Kiosk Sorter**.
 
 The Setup executable contains the packaged Python runtime and application
-dependencies. End users do not need to install Python, Inno Setup, or the
-Source ZIP.
+dependencies. End users do not need Python, Inno Setup, or the Source ZIP.
 
 ### Windows SmartScreen
 
 If the Setup executable is not code-signed, Windows may display **Windows
-protected your PC**. Confirm that the file came from the official GitHub
-release and verify its published SHA-256 checksum. Then select **More info**
-and **Run anyway**.
-
-To verify a checksum in PowerShell:
+protected your PC**. Confirm that the file came from the official release and
+verify its published SHA-256 checksum. Then select **More info** and **Run
+anyway**.
 
 ```powershell
-Get-FileHash .\ShibbyPrints-Kiosk-2.2-Public-Setup.exe -Algorithm SHA256
+Get-FileHash .\ShibbyPrints-Kiosk-2.3-Public-Setup.exe -Algorithm SHA256
 ```
 
 The displayed hash must exactly match the checksum published with the release.
@@ -51,23 +51,67 @@ The displayed hash must exactly match the checksum published with the release.
 3. Run Setup normally. Do not uninstall the existing version first.
 
 The installer keeps a permanent application identity and recognizes an
-existing installation. It replaces only the packaged application runtime.
-Models, configuration, login state, Saved Bins, and diagnostic exports remain
-in their established user-data locations.
+existing installation. It replaces the packaged runtime while preserving
+models, configuration, login state, Saved Bins, and diagnostic exports.
 
 ## First-launch checks
 
-After installation:
-
 1. Confirm the camera preview appears.
-2. Confirm the correct serial controller connects.
+2. Confirm the correct sorter connection is selected.
 3. Confirm the saved camera-light brightness is restored.
 4. Select or configure the required local or remote model.
-5. Verify slot assignments before starting a production run.
+5. Verify the image crop and slot assignments before sorting.
 
-If the application warns that Windows shared-camera mode is active, disable
+If Windows shared-camera mode prevents the preferred camera format, disable
 **Allow multiple apps to use camera at the same time** in Windows camera
-settings and restart the application.
+settings and restart Kiosk.
+
+## Connect the sorter
+
+USB is the default connection.
+
+For a compatible Kiosk Node:
+
+1. Open **Maintenance → Serial**.
+2. Select **Kiosk Node (network sorter)**.
+3. Enter the sorter's IP address.
+4. Connect and confirm that machine settings can be read.
+
+The connection method does not change the normal Operator controls, image
+processing, bin assignments, or run workflow.
+
+## Configure remote inference
+
+Open the AI configuration page, enter the compatible server endpoint and
+optional API key, then use **Connect and Find Models**. Choose a model and load
+its classifications. Server-provided classifications are read-only; assign
+them to bins from the Run interface.
+
+## Configure the integrated API server
+
+1. Open **Maintenance → Server**.
+2. Assign a short API name to each installed model clients may request.
+3. Optionally generate an API key and save the same key on each client.
+4. Enable **Preload** only for models needed immediately.
+5. Select **Local network**, save, and press **Start Server**.
+6. On each client, use **Connect and Find Models**.
+
+The attached sorter can continue using local inference while remote clients
+use the integrated server. Stop the server before changing assignments or
+network settings. Never expose the server directly to the Internet.
+
+## Enable browser access
+
+1. Open **Maintenance → LAN Access**.
+2. Enter a sorter name containing letters, numbers, and interior hyphens.
+3. Select **Enable Web Interface**.
+4. Keep **Keep the Desktop Interface available on this PC** checked for both
+   interfaces, or clear it for browser-only presentation on the next launch.
+5. Save and open the displayed `.local` or direct-IP URL from a device on the
+   same private network.
+
+The web interface is disabled by default. Use it only on a trusted private
+network.
 
 ## Build the official Setup executable
 
@@ -75,84 +119,66 @@ Building is intended for maintainers. It requires:
 
 - 64-bit Windows;
 - an internet connection for Python packages;
-- Python 3.10 or newer; and
-- Inno Setup 6.
-
-The build downloads large machine-learning dependencies and requires several
-gigabytes of temporary disk space.
+- Python 3.10 or newer;
+- Inno Setup 6; and
+- several gigabytes of temporary disk space.
 
 ### 1. Prepare the source
 
-1. Download `ShibbyPrints-Kiosk-2.2-Public-Source.zip`.
-2. Use **Extract All**. Do not run build scripts from inside the ZIP viewer.
-3. For convenience, extract to a short local path such as:
+1. Download `ShibbyPrints-Kiosk-2.3-Public-Source.zip`.
+2. Use **Extract All**. Do not run scripts from inside the ZIP viewer.
+3. For convenience, extract to a short path such as:
 
-   `C:\ShibbyPrints-Kiosk-2.2-Public`
+   `C:\ShibbyPrints-Kiosk-2.3-Public-Source`
 
-4. Confirm the extracted folder contains `build_installer.bat`,
-   `build_windows.bat`, `ShibbyPrintsCaseSorterInstaller.iss`, `LICENSE`, and
-   `NOTICE`.
+4. Confirm the folder contains `build_installer.bat`, `build_windows.bat`,
+   `ShibbyPrintsCaseSorterInstaller.iss`, `LICENSE`, and `NOTICE`.
 
 ### 2. Install Inno Setup 6
 
-Install Inno Setup 6 from its official website:
+Install Inno Setup 6 from:
 
 https://jrsoftware.org/isinfo.php
 
-The build script searches the normal 32-bit and 64-bit Inno Setup installation
-locations and also accepts `ISCC.exe` on the system PATH.
+The build searches the normal 32-bit and 64-bit installation locations and
+also accepts `ISCC.exe` on `PATH`.
 
 ### 3. Run the build
 
-Double-click:
+Double-click `build_installer.bat`.
 
-`build_installer.bat`
+The script:
 
-The script performs these steps:
-
-1. Locates Python 3.10 or newer.
-2. If Python is missing, asks permission before installing Python 3.12 with
-   Windows Package Manager. Declining stops the build without installing it.
-3. Generates and validates release metadata.
-4. Installs and verifies production dependencies.
-5. Runs the automated test suite.
-6. Builds the PyInstaller ONEDIR application.
-7. Verifies the packaged runtime.
-8. Copies the runtime to a short temporary staging path.
-9. Compiles the Inno Setup installer.
-10. Copies the completed Setup executable back to `installer_output` and opens
-    that folder in File Explorer.
+1. Locates a supported Python installation.
+2. Offers to install Python through Windows Package Manager if necessary.
+3. Generates and validates public release metadata.
+4. Creates or reuses fingerprinted CPU and CUDA dependency environments.
+5. Verifies production imports and camera dependencies.
+6. Runs the automated source-validation suite.
+7. Builds and validates separate CPU and CUDA ONEDIR applications.
+8. Compiles the Inno Setup installer.
+9. Copies the completed Setup executable to `installer_output`.
 
 The completed installer is:
 
-`installer_output\ShibbyPrints-Kiosk-2.2-Public-Setup.exe`
+`installer_output\ShibbyPrints-Kiosk-2.3-Public-Setup.exe`
 
-That Setup executable is the only application file an ordinary Windows user
-needs for installation. Publish the matching Source ZIP beside it.
+Publish the matching Source ZIP beside it.
+
+Set `SHIBBYPRINTS_REBUILD_DEPENDENCIES=1` before launching the build to force
+fresh dependency environments for troubleshooting.
 
 ## Build only the unpackaged application
 
-Run:
-
-`build_windows.bat`
-
-The unpackaged application is created under:
-
-`dist\ShibbyPrintsCaseSorter`
-
-The executable depends on the rest of that ONEDIR folder. Do not move or
-distribute the executable by itself.
+Run `build_windows.bat`. The applications are created under
+`dist_cpu\ShibbyPrintsCaseSorter` and `dist_cuda\ShibbyPrintsCaseSorter`.
+Each executable depends on the rest of its ONEDIR folder.
 
 ## Recompile after an installer-only failure
 
-If `build_windows.bat` completed and the ONEDIR runtime is valid, but Inno Setup
-was missing or installer compilation failed:
-
-1. Correct the Inno Setup problem.
-2. Double-click `Compile Installer From Existing Build.bat`.
-
-This reuses `dist\ShibbyPrintsCaseSorter` and avoids rebuilding Python,
-PyTorch, and the application.
+If application builds completed but Inno Setup was missing or installer
+compilation failed, correct the installer problem and run
+`Compile Installer From Existing Build.bat`.
 
 ## Build troubleshooting
 
@@ -163,6 +189,6 @@ Build diagnostics are written to:
 - `build_report\environment.txt`
 - `build_report\checksums.txt`
 
-If a build fails, read `errors.log` first, then inspect the end of `build.log`.
-Do not manually move the executable out of the ONEDIR folder or compile the
-`.iss` file against an incomplete `dist` directory.
+Read `errors.log` first, then inspect the end of `build.log`. Do not move an
+executable out of its ONEDIR folder or compile the installer against an
+incomplete staging directory.

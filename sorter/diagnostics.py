@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 import io
 import json
 import os
@@ -13,11 +14,40 @@ import time
 import zipfile
 from collections import deque
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import cv2
 import numpy as np
+
+
+@contextmanager
+def _atomic_zip(destination: Path):
+    """Yield a ZIP writer and publish it only after a complete close/fsync."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = Path(str(destination) + ".partial")
+    partial.unlink(missing_ok=True)
+    try:
+        # Keep one writable handle through ZIP close and fsync. Windows rejects
+        # fsync on a descriptor reopened read-only (EBADF), even though that
+        # pattern is accepted on POSIX systems.
+        with partial.open("w+b") as stream:
+            with zipfile.ZipFile(
+                stream, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                yield archive
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def _safe_extra_member(name: str) -> str:
+    candidate = PurePosixPath(str(name).replace("\\", "/"))
+    if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
+        raise ValueError(f"Unsafe diagnostic member name: {name!r}")
+    return candidate.as_posix()
 
 
 class DiagnosticCollector:
@@ -230,7 +260,13 @@ class DiagnosticCollector:
                 "recent_serial": list(self._serial)[-20:],
             }
 
-    def export_zip(self, destination: str | os.PathLike[str], camera_info: dict[str, Any], app_info: dict[str, Any]) -> Path:
+    def export_zip(
+        self,
+        destination: str | os.PathLike[str],
+        camera_info: dict[str, Any],
+        app_info: dict[str, Any],
+        extra_members: dict[str, bytes] | None = None,
+    ) -> Path:
         destination = Path(destination)
         with self._lock:
             frames = list(self._frames)
@@ -261,9 +297,14 @@ class DiagnosticCollector:
             "processor": platform.processor(),
         }
 
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        with _atomic_zip(destination) as zf:
             zf.writestr("diagnostic_report.json", json.dumps(report, indent=2, default=str))
+            active=app_info.get("connection_transport") or {}
+            previous=app_info.get("last_disconnect_transport")
+            if active.get("type")=="esp" or previous:
+                zf.writestr("esp_transport_evidence.json",json.dumps(
+                    {"connection_transport":active,"last_disconnect_transport":previous},
+                    indent=2,default=str))
             zf.writestr("system_info.json", json.dumps(system_info, indent=2))
             zf.writestr("camera_properties.json", json.dumps(camera_info, indent=2, default=str))
             # Carry build provenance with every diagnostic archive. In a
@@ -326,6 +367,8 @@ class DiagnosticCollector:
             self._write_image(zf, "sample_frames/brightest_frame.jpg", bright)
             self._write_image(zf, "sample_frames/darkest_frame.jpg", dark)
             self._write_image(zf, "sample_frames/reference_frame.jpg", ref)
+            for name, data in sorted((extra_members or {}).items()):
+                zf.writestr(_safe_extra_member(name), data)
         return destination
 
     def live_stats_unlocked(self) -> dict[str, Any]:
